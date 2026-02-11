@@ -1,16 +1,21 @@
 extern "C" {
-  #include <libavcodec/avcodec.h>
-  #include <libavformat/avformat.h>
-  #include <libavutil/avutil.h>
-  #include <libavutil/imgutils.h>
-  #include <libavutil/opt.h>
-  #include <libswscale/swscale.h>
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/avutil.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
+#include <libswscale/swscale.h>
 }
 
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <inttypes.h>
+#include <ctime>
+#include <sys/stat.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -42,6 +47,88 @@ struct EncodeOutput {
 };
 
 /**
+ * @brief Global log file handle
+ */
+static FILE *g_log = nullptr;
+
+/**
+ * @brief Initialize log file
+ *
+ * @param path Log file path
+ * @return true if opened, false otherwise
+ */
+static bool log_init(const std::string &path) {
+  /** Open log file */
+  g_log = std::fopen(path.c_str(), "a");
+  if (!g_log) {
+    std::fprintf(stderr, "Failed to open log file: %s\n", path.c_str());
+    return false;
+  }
+
+  /** Line-buffer logs */
+  std::setvbuf(g_log, nullptr, _IOLBF, 0);
+  return true;
+}
+
+/**
+ * @brief Close log file
+ */
+static void log_close() {
+  /** Close log file */
+  if (!g_log) {
+    return;
+  }
+  std::fclose(g_log);
+  g_log = nullptr;
+}
+
+/**
+ * @brief Log a message to file
+ *
+ * @param level Log level label
+ * @param fmt printf-style format
+ */
+static void log_message(const char *level, const char *fmt, ...) {
+  /** Skip if logger is not initialized */
+  if (!g_log) {
+    return;
+  }
+
+  /** Timestamp for logs */
+  std::time_t now = std::time(nullptr);
+  std::tm tm_buf;
+#if defined(_WIN32)
+  localtime_s(&tm_buf, &now);
+#else
+  localtime_r(&now, &tm_buf);
+#endif
+
+  char ts[32];
+  std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_buf);
+
+  std::fprintf(g_log, "[%s] %s ", level, ts);
+
+  va_list args;
+  va_start(args, fmt);
+  std::vfprintf(g_log, fmt, args);
+  va_end(args);
+
+  std::fprintf(g_log, "\n");
+}
+
+/**
+ * @brief Suppress libav logging
+ */
+static void quiet_av_log_callback(void *ptr, int level, const char *fmt,
+                                  va_list vl) {
+  /** Ignore libav logs */
+  (void)ptr;
+  (void)level;
+  (void)fmt;
+  (void)vl;
+}
+
+/**
  * @brief Print CLI usage instructions
  * 
  * @param argv0 
@@ -51,7 +138,8 @@ static void print_usage(const char *argv0) {
   std::fprintf(
       stderr,
       "Usage: %s <input_url> <output_path> [--rtsp-tcp] [--reconnect-sec N] "
-      "[--max-keep-minutes M] [--hls-time S]\n"
+      "[--max-keep-minutes M] [--hls-time S] [--log-file PATH]\n"
+      "Note: If output_path is a directory, index.m3u8 is created inside.\n"
       "Example: %s rtsp://cam/stream out.m3u8 --max-keep-minutes 5\n",
       argv0, argv0);
 }
@@ -82,6 +170,18 @@ static bool starts_with(const std::string &s, const char *prefix) {
 }
 
 /**
+ * @brief Check if input scheme is treated as live
+ *
+ * @param url
+ * @return true
+ * @return false
+ */
+static bool is_live_input(const std::string &url) {
+  /** RTSP/RTMP are treated as live sources */
+  return starts_with(url, "rtsp") || starts_with(url, "rtmp");
+}
+
+/**
  * @brief Is input HLS based on URL pattern
  * 
  * @param url 
@@ -91,6 +191,49 @@ static bool starts_with(const std::string &s, const char *prefix) {
 static bool is_hls_input(const std::string &url) {
   /** Detect HLS input by extension */
   return url.find(".m3u8") != std::string::npos;
+}
+
+/**
+ * @brief Check if a path is a directory
+ *
+ * @param path
+ * @return true
+ * @return false
+ */
+static bool is_directory(const std::string &path) {
+  /** Stat the path */
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0) {
+    return false;
+  }
+  return S_ISDIR(st.st_mode);
+}
+
+/**
+ * @brief Normalize output path to an HLS playlist file
+ *
+ * @param output_path
+ * @return std::string
+ */
+static std::string normalize_output_path(const std::string &output_path) {
+  /** Detect directory output */
+  if (!output_path.empty() &&
+      (output_path.back() == '/' || is_directory(output_path))) {
+    std::string dir = output_path;
+    if (dir.back() != '/') {
+      dir.push_back('/');
+    }
+    return dir + "index.m3u8";
+  }
+
+  /** Ensure .m3u8 extension */
+  size_t slash = output_path.find_last_of('/');
+  size_t dot = output_path.find_last_of('.');
+  if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) {
+    return output_path + ".m3u8";
+  }
+
+  return output_path;
 }
 
 /**
@@ -135,7 +278,7 @@ static int set_hls_output_options(AVDictionary **opts, int max_keep_minutes,
   /** Apply HLS options */
   av_dict_set_int(opts, "hls_time", hls_time_sec, 0);
   av_dict_set_int(opts, "hls_list_size", list_size, 0);
-  av_dict_set(opts, "hls_flags", "delete_segments", 0);
+  av_dict_set(opts, "hls_flags", "delete_segments+omit_endlist", 0);
   av_dict_set(opts, "hls_segment_filename", segment_pattern.c_str(), 0);
 
   return 0;
@@ -158,8 +301,8 @@ static int open_input(const std::string &input_url, bool rtsp_tcp,
     if (rtsp_tcp) {
       av_dict_set(&opts, "rtsp_transport", "tcp", 0);
     }
-    av_dict_set(&opts, "stimeout", "5000000", 0);
-    av_dict_set(&opts, "rw_timeout", "5000000", 0);
+    av_dict_set(&opts, "stimeout", "10000000", 0);
+    av_dict_set(&opts, "rw_timeout", "10000000", 0);
   }
 
   /** Apply HTTP reconnect options for HLS and HTTP(S) inputs */
@@ -174,18 +317,24 @@ static int open_input(const std::string &input_url, bool rtsp_tcp,
   int ret = avformat_open_input(in_ctx, input_url.c_str(), nullptr, &opts);
   av_dict_free(&opts);
   if (ret < 0) {
-    std::fprintf(stderr, "Failed to open input: %s\n",
-                 av_err2str_cpp(ret).c_str());
+    log_message("ERROR", "Failed to open input: %s",
+                av_err2str_cpp(ret).c_str());
     return ret;
   }
+
+  /** Generate missing PTS if needed */
+  (*in_ctx)->flags |= AVFMT_FLAG_GENPTS;
 
   /** Load stream info */
   ret = avformat_find_stream_info(*in_ctx, nullptr);
   if (ret < 0) {
-    std::fprintf(stderr, "Failed to find stream info: %s\n",
-                 av_err2str_cpp(ret).c_str());
+    log_message("ERROR", "Failed to find stream info: %s",
+                av_err2str_cpp(ret).c_str());
     return ret;
   }
+
+  /** Log stream discovery */
+  log_message("INFO", "Opened input with %u streams", (*in_ctx)->nb_streams);
 
   return 0;
 }
@@ -208,8 +357,8 @@ static int open_copy_output(const std::string &output_path,
   int ret = avformat_alloc_output_context2(out_ctx, nullptr, "hls",
                                            output_path.c_str());
   if (ret < 0 || !*out_ctx) {
-    std::fprintf(stderr, "Failed to create output context: %s\n",
-                 av_err2str_cpp(ret).c_str());
+    log_message("ERROR", "Failed to create output context: %s",
+                av_err2str_cpp(ret).c_str());
     return ret < 0 ? ret : AVERROR_UNKNOWN;
   }
 
@@ -218,14 +367,14 @@ static int open_copy_output(const std::string &output_path,
     AVStream *in_stream = in_ctx->streams[i];
     AVStream *out_stream = avformat_new_stream(*out_ctx, nullptr);
     if (!out_stream) {
-      std::fprintf(stderr, "Failed to allocate output stream\n");
+      log_message("ERROR", "Failed to allocate output stream");
       return AVERROR(ENOMEM);
     }
 
     ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
     if (ret < 0) {
-      std::fprintf(stderr, "Failed to copy codec parameters: %s\n",
-                   av_err2str_cpp(ret).c_str());
+      log_message("ERROR", "Failed to copy codec parameters: %s",
+                  av_err2str_cpp(ret).c_str());
       return ret;
     }
 
@@ -237,8 +386,8 @@ static int open_copy_output(const std::string &output_path,
   if (!((*out_ctx)->oformat->flags & AVFMT_NOFILE)) {
     ret = avio_open(&(*out_ctx)->pb, output_path.c_str(), AVIO_FLAG_WRITE);
     if (ret < 0) {
-      std::fprintf(stderr, "Failed to open output file: %s\n",
-                   av_err2str_cpp(ret).c_str());
+      log_message("ERROR", "Failed to open output file: %s",
+                  av_err2str_cpp(ret).c_str());
       return ret;
     }
   }
@@ -252,8 +401,8 @@ static int open_copy_output(const std::string &output_path,
   ret = avformat_write_header(*out_ctx, &hls_opts);
   av_dict_free(&hls_opts);
   if (ret < 0) {
-    std::fprintf(stderr, "Failed to write header: %s\n",
-                 av_err2str_cpp(ret).c_str());
+    log_message("ERROR", "Failed to write header: %s",
+                av_err2str_cpp(ret).c_str());
     return ret;
   }
 
@@ -275,14 +424,14 @@ static int add_audio_stream_copy(AVFormatContext *in_ctx,
   AVStream *in_stream = in_ctx->streams[audio_index];
   AVStream *out_stream = avformat_new_stream(out_ctx, nullptr);
   if (!out_stream) {
-    std::fprintf(stderr, "Failed to allocate audio stream\n");
+    log_message("ERROR", "Failed to allocate audio stream");
     return AVERROR(ENOMEM);
   }
 
   int ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
   if (ret < 0) {
-    std::fprintf(stderr, "Failed to copy audio codec parameters: %s\n",
-                 av_err2str_cpp(ret).c_str());
+    log_message("ERROR", "Failed to copy audio codec parameters: %s",
+                av_err2str_cpp(ret).c_str());
     return ret;
   }
 
@@ -306,13 +455,14 @@ static int init_video_encoder(EncodeOutput &out, const Rendition &rendition,
   /** Find H.264 encoder */
   const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_H264);
   if (!codec) {
-    std::fprintf(stderr, "H.264 encoder not found\n");
+    log_message("ERROR", "H.264 encoder not found");
     return AVERROR_ENCODER_NOT_FOUND;
   }
 
   /** Create encoder context */
   out.venc = avcodec_alloc_context3(codec);
   if (!out.venc) {
+    log_message("ERROR", "Failed to allocate encoder context");
     return AVERROR(ENOMEM);
   }
 
@@ -338,8 +488,8 @@ static int init_video_encoder(EncodeOutput &out, const Rendition &rendition,
   /** Open encoder */
   int ret = avcodec_open2(out.venc, codec, nullptr);
   if (ret < 0) {
-    std::fprintf(stderr, "Failed to open H.264 encoder: %s\n",
-                 av_err2str_cpp(ret).c_str());
+    log_message("ERROR", "Failed to open H.264 encoder: %s",
+                av_err2str_cpp(ret).c_str());
     return ret;
   }
 
@@ -368,8 +518,8 @@ static int init_reencode_output(const std::string &output_path,
   int ret = avformat_alloc_output_context2(&out.fmt, nullptr, "hls",
                                            output_path.c_str());
   if (ret < 0 || !out.fmt) {
-    std::fprintf(stderr, "Failed to create output context: %s\n",
-                 av_err2str_cpp(ret).c_str());
+    log_message("ERROR", "Failed to create output context: %s",
+                av_err2str_cpp(ret).c_str());
     return ret < 0 ? ret : AVERROR_UNKNOWN;
   }
 
@@ -383,20 +533,21 @@ static int init_reencode_output(const std::string &output_path,
   /** Allocate reusable packet */
   out.enc_pkt = av_packet_alloc();
   if (!out.enc_pkt) {
+    log_message("ERROR", "Failed to allocate encoder packet");
     return AVERROR(ENOMEM);
   }
 
   /** Add video stream */
   out.vstream = avformat_new_stream(out.fmt, nullptr);
   if (!out.vstream) {
-    std::fprintf(stderr, "Failed to allocate video stream\n");
+    log_message("ERROR", "Failed to allocate video stream");
     return AVERROR(ENOMEM);
   }
 
   ret = avcodec_parameters_from_context(out.vstream->codecpar, out.venc);
   if (ret < 0) {
-    std::fprintf(stderr, "Failed to set video stream params: %s\n",
-                 av_err2str_cpp(ret).c_str());
+    log_message("ERROR", "Failed to set video stream params: %s",
+                av_err2str_cpp(ret).c_str());
     return ret;
   }
 
@@ -415,8 +566,8 @@ static int init_reencode_output(const std::string &output_path,
   if (!(out.fmt->oformat->flags & AVFMT_NOFILE)) {
     ret = avio_open(&out.fmt->pb, output_path.c_str(), AVIO_FLAG_WRITE);
     if (ret < 0) {
-      std::fprintf(stderr, "Failed to open output file: %s\n",
-                   av_err2str_cpp(ret).c_str());
+      log_message("ERROR", "Failed to open output file: %s",
+                  av_err2str_cpp(ret).c_str());
       return ret;
     }
   }
@@ -430,8 +581,8 @@ static int init_reencode_output(const std::string &output_path,
   ret = avformat_write_header(out.fmt, &hls_opts);
   av_dict_free(&hls_opts);
   if (ret < 0) {
-    std::fprintf(stderr, "Failed to write header: %s\n",
-                 av_err2str_cpp(ret).c_str());
+    log_message("ERROR", "Failed to write header: %s",
+                av_err2str_cpp(ret).c_str());
     return ret;
   }
 
@@ -453,13 +604,14 @@ static int init_sws_for_output(EncodeOutput &out, AVFrame *in_frame) {
                            out.venc->pix_fmt, SWS_BILINEAR, nullptr, nullptr,
                            nullptr);
   if (!out.sws) {
-    std::fprintf(stderr, "Failed to create swscale context\n");
+    log_message("ERROR", "Failed to create swscale context");
     return AVERROR(EINVAL);
   }
 
   /** Allocate scaled frame */
   out.sws_frame = av_frame_alloc();
   if (!out.sws_frame) {
+    log_message("ERROR", "Failed to allocate sws frame");
     return AVERROR(ENOMEM);
   }
 
@@ -469,8 +621,8 @@ static int init_sws_for_output(EncodeOutput &out, AVFrame *in_frame) {
 
   int ret = av_frame_get_buffer(out.sws_frame, 32);
   if (ret < 0) {
-    std::fprintf(stderr, "Failed to allocate sws frame: %s\n",
-                 av_err2str_cpp(ret).c_str());
+    log_message("ERROR", "Failed to allocate sws frame: %s",
+                av_err2str_cpp(ret).c_str());
     return ret;
   }
 
@@ -505,7 +657,7 @@ static int write_copy_packet(AVFormatContext *in_ctx, AVFormatContext *out_ctx,
 
   int ret = av_interleaved_write_frame(out_ctx, pkt);
   if (ret < 0) {
-    std::fprintf(stderr, "Write error: %s\n", av_err2str_cpp(ret).c_str());
+    log_message("ERROR", "Write error: %s", av_err2str_cpp(ret).c_str());
     return ret;
   }
 
@@ -525,6 +677,7 @@ static int encode_and_write_frame(EncodeOutput &out, AVFrame *in_frame,
   /** Prepare scaled frame */
   int ret = av_frame_make_writable(out.sws_frame);
   if (ret < 0) {
+    log_message("ERROR", "Frame not writable: %s", av_err2str_cpp(ret).c_str());
     return ret;
   }
 
@@ -536,7 +689,7 @@ static int encode_and_write_frame(EncodeOutput &out, AVFrame *in_frame,
   /** Send to encoder */
   ret = avcodec_send_frame(out.venc, out.sws_frame);
   if (ret < 0) {
-    std::fprintf(stderr, "Encode send error: %s\n", av_err2str_cpp(ret).c_str());
+    log_message("ERROR", "Encode send error: %s", av_err2str_cpp(ret).c_str());
     return ret;
   }
 
@@ -548,8 +701,8 @@ static int encode_and_write_frame(EncodeOutput &out, AVFrame *in_frame,
       break;
     }
     if (ret < 0) {
-      std::fprintf(stderr, "Encode receive error: %s\n",
-                   av_err2str_cpp(ret).c_str());
+      log_message("ERROR", "Encode receive error: %s",
+                  av_err2str_cpp(ret).c_str());
       av_packet_unref(out.enc_pkt);
       return ret;
     }
@@ -561,7 +714,7 @@ static int encode_and_write_frame(EncodeOutput &out, AVFrame *in_frame,
     ret = av_interleaved_write_frame(out.fmt, out.enc_pkt);
     av_packet_unref(out.enc_pkt);
     if (ret < 0) {
-      std::fprintf(stderr, "Write error: %s\n", av_err2str_cpp(ret).c_str());
+      log_message("ERROR", "Write error: %s", av_err2str_cpp(ret).c_str());
       return ret;
     }
   }
@@ -602,7 +755,7 @@ static int write_audio_packet_to_output(AVFormatContext *in_ctx,
 
   int ret = av_interleaved_write_frame(out_ctx, pkt);
   if (ret < 0) {
-    std::fprintf(stderr, "Write audio error: %s\n", av_err2str_cpp(ret).c_str());
+    log_message("ERROR", "Write audio error: %s", av_err2str_cpp(ret).c_str());
     return ret;
   }
 
@@ -620,6 +773,7 @@ static int flush_encoders(std::vector<EncodeOutput> &outputs) {
   for (auto &out : outputs) {
     int ret = avcodec_send_frame(out.venc, nullptr);
     if (ret < 0) {
+      log_message("ERROR", "Flush send error: %s", av_err2str_cpp(ret).c_str());
       return ret;
     }
 
@@ -629,6 +783,8 @@ static int flush_encoders(std::vector<EncodeOutput> &outputs) {
         break;
       }
       if (ret < 0) {
+        log_message("ERROR", "Flush receive error: %s",
+                    av_err2str_cpp(ret).c_str());
         av_packet_unref(out.enc_pkt);
         return ret;
       }
@@ -640,6 +796,8 @@ static int flush_encoders(std::vector<EncodeOutput> &outputs) {
       ret = av_interleaved_write_frame(out.fmt, out.enc_pkt);
       av_packet_unref(out.enc_pkt);
       if (ret < 0) {
+        log_message("ERROR", "Flush write error: %s",
+                    av_err2str_cpp(ret).c_str());
         return ret;
       }
     }
@@ -710,10 +868,12 @@ int main(int argc, char **argv) {
   /** Capture CLI inputs */
   std::string input_url = argv[1];
   std::string output_path = argv[2];
+  std::string log_file = "streamer.log";
   bool rtsp_tcp = false;
   int reconnect_sec = 0;
   int max_keep_minutes = 5;
   int hls_time_sec = 4;
+  bool live_input = is_live_input(input_url);
 
   /** Parse CLI */
   for (int i = 3; i < argc; ++i) {
@@ -728,12 +888,34 @@ int main(int argc, char **argv) {
     } else if (std::strcmp(argv[i], "--hls-time") == 0 && i + 1 < argc) {
       hls_time_sec = std::atoi(argv[i + 1]);
       ++i;
+    } else if (std::strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
+      log_file = argv[i + 1];
+      ++i;
     } else {
       std::fprintf(stderr, "Unknown argument: %s\n", argv[i]);
       print_usage(argv[0]);
       return 1;
     }
   }
+
+  /** Initialize logger */
+  if (!log_init(log_file)) {
+    return 1;
+  }
+
+  /** Normalize output path */
+  output_path = normalize_output_path(output_path);
+
+  /** Auto-reconnect for live inputs unless disabled */
+  if (live_input && reconnect_sec <= 0) {
+    reconnect_sec = 5;
+  }
+
+  /** Log configuration */
+  log_message("INFO", "Input URL: %s", input_url.c_str());
+  log_message("INFO", "Output HLS: %s", output_path.c_str());
+  log_message("INFO", "Log file: %s", log_file.c_str());
+  log_message("INFO", "Reconnect seconds: %d", reconnect_sec);
 
   /** Static ladder for low/mid/high */
   std::vector<Rendition> renditions = {
@@ -743,7 +925,8 @@ int main(int argc, char **argv) {
   };
 
   /** Initialize FFmpeg */
-  av_log_set_level(AV_LOG_INFO);
+  av_log_set_level(AV_LOG_QUIET);
+  av_log_set_callback(quiet_av_log_callback);
   avformat_network_init();
 
   /** Reconnect loop */
@@ -756,7 +939,7 @@ int main(int argc, char **argv) {
     int ret = open_input(input_url, rtsp_tcp, &in_ctx);
     if (ret < 0) {
       if (reconnect_sec > 0) {
-        std::fprintf(stderr, "Retrying in %d seconds...\n", reconnect_sec);
+        log_message("INFO", "Retrying in %d seconds...", reconnect_sec);
         std::this_thread::sleep_for(std::chrono::seconds(reconnect_sec));
         continue;
       }
@@ -768,7 +951,7 @@ int main(int argc, char **argv) {
     int video_index = av_find_best_stream(in_ctx, AVMEDIA_TYPE_VIDEO, -1, -1,
                                           nullptr, 0);
     if (video_index < 0) {
-      std::fprintf(stderr, "No video stream found\n");
+      log_message("ERROR", "No video stream found");
       avformat_close_input(&in_ctx);
       exit_code = 3;
       break;
@@ -782,7 +965,7 @@ int main(int argc, char **argv) {
     AVStream *video_stream = in_ctx->streams[video_index];
     const AVCodec *decoder = avcodec_find_decoder(video_stream->codecpar->codec_id);
     if (!decoder) {
-      std::fprintf(stderr, "Video decoder not found\n");
+      log_message("ERROR", "Video decoder not found");
       avformat_close_input(&in_ctx);
       exit_code = 3;
       break;
@@ -790,6 +973,7 @@ int main(int argc, char **argv) {
 
     AVCodecContext *vdec = avcodec_alloc_context3(decoder);
     if (!vdec) {
+      log_message("ERROR", "Failed to allocate decoder context");
       avformat_close_input(&in_ctx);
       exit_code = 3;
       break;
@@ -797,8 +981,8 @@ int main(int argc, char **argv) {
 
     ret = avcodec_parameters_to_context(vdec, video_stream->codecpar);
     if (ret < 0) {
-      std::fprintf(stderr, "Failed to set decoder params: %s\n",
-                   av_err2str_cpp(ret).c_str());
+      log_message("ERROR", "Failed to set decoder params: %s",
+                  av_err2str_cpp(ret).c_str());
       avcodec_free_context(&vdec);
       avformat_close_input(&in_ctx);
       exit_code = 3;
@@ -807,8 +991,8 @@ int main(int argc, char **argv) {
 
     ret = avcodec_open2(vdec, decoder, nullptr);
     if (ret < 0) {
-      std::fprintf(stderr, "Failed to open decoder: %s\n",
-                   av_err2str_cpp(ret).c_str());
+      log_message("ERROR", "Failed to open decoder: %s",
+                  av_err2str_cpp(ret).c_str());
       avcodec_free_context(&vdec);
       avformat_close_input(&in_ctx);
       exit_code = 3;
@@ -860,14 +1044,14 @@ int main(int argc, char **argv) {
     {
       AVPacket *pkt = av_packet_alloc();
       if (!pkt) {
-        std::fprintf(stderr, "Failed to allocate packet\n");
+        log_message("ERROR", "Failed to allocate packet");
         exit_code = 5;
         goto cleanup_loop;
       }
 
       AVPacket *audio_pkt = av_packet_alloc();
       if (!audio_pkt) {
-        std::fprintf(stderr, "Failed to allocate audio packet\n");
+        log_message("ERROR", "Failed to allocate audio packet");
         av_packet_free(&pkt);
         exit_code = 5;
         goto cleanup_loop;
@@ -875,7 +1059,7 @@ int main(int argc, char **argv) {
 
       AVFrame *decoded = av_frame_alloc();
       if (!decoded) {
-        std::fprintf(stderr, "Failed to allocate decode frame\n");
+        log_message("ERROR", "Failed to allocate decode frame");
         av_packet_free(&audio_pkt);
         av_packet_free(&pkt);
         exit_code = 5;
@@ -884,22 +1068,32 @@ int main(int argc, char **argv) {
 
       int64_t fallback_pts = 0;
 
+      int64_t frame_count = 0;
       while (true) {
         ret = av_read_frame(in_ctx, pkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR(ETIMEDOUT)) {
+          log_message("WARN", "Read timeout, retrying...");
+          std::this_thread::sleep_for(std::chrono::seconds(1));
+          continue;
+        }
         if (ret == AVERROR_EOF) {
+          log_message("WARN", "Input reached EOF");
           break;
         }
         if (ret < 0) {
-          std::fprintf(stderr, "Read error: %s\n", av_err2str_cpp(ret).c_str());
+          log_message("ERROR", "Read error: %s", av_err2str_cpp(ret).c_str());
           break;
         }
+
+        log_message("DEBUG", "Read packet from stream %d, size %d, pts %" PRId64,
+                    pkt->stream_index, pkt->size, pkt->pts);
 
         /** Decode video for renditions */
         if (pkt->stream_index == video_index) {
           ret = avcodec_send_packet(vdec, pkt);
           if (ret < 0) {
-            std::fprintf(stderr, "Decode send error: %s\n",
-                         av_err2str_cpp(ret).c_str());
+            log_message("ERROR", "Decode send error: %s",
+                        av_err2str_cpp(ret).c_str());
             av_packet_unref(pkt);
             break;
           }
@@ -910,8 +1104,8 @@ int main(int argc, char **argv) {
               break;
             }
             if (ret < 0) {
-              std::fprintf(stderr, "Decode receive error: %s\n",
-                           av_err2str_cpp(ret).c_str());
+              log_message("ERROR", "Decode receive error: %s",
+                          av_err2str_cpp(ret).c_str());
               break;
             }
 
@@ -920,11 +1114,15 @@ int main(int argc, char **argv) {
               if (!out.sws) {
                 ret = init_sws_for_output(out, decoded);
                 if (ret < 0) {
+                  log_message("ERROR", "Init sws error: %s",
+                              av_err2str_cpp(ret).c_str());
                   break;
                 }
               }
             }
             if (ret < 0) {
+              log_message("ERROR", "Audio packet ref error: %s",
+                          av_err2str_cpp(ret).c_str());
               break;
             }
 
@@ -940,14 +1138,20 @@ int main(int argc, char **argv) {
                                              out.venc->time_base);
               ret = encode_and_write_frame(out, decoded, enc_pts);
               if (ret < 0) {
+                log_message("ERROR", "encode and write error: %s",
+                          av_err2str_cpp(ret).c_str());
                 break;
               }
             }
             if (ret < 0) {
+              log_message("ERROR", "Audio write error: %s",
+                          av_err2str_cpp(ret).c_str());
               break;
             }
           }
           if (ret < 0) {
+            log_message("ERROR", "in loop: %s",
+                          av_err2str_cpp(ret).c_str());
             av_packet_unref(pkt);
             break;
           }
@@ -981,11 +1185,19 @@ int main(int argc, char **argv) {
         /** Write copy output */
         ret = write_copy_packet(in_ctx, copy_ctx, pkt);
         if (ret < 0) {
+          log_message("ERROR", "Copy write error: %s",
+                      av_err2str_cpp(ret).c_str());
           av_packet_unref(pkt);
           break;
         }
 
         av_packet_unref(pkt);
+
+        /** Periodic progress log */
+        frame_count++;
+        if (frame_count % 300 == 0) {
+          log_message("INFO", "Processed %" PRId64 " packets", frame_count);
+        }
       }
 
       av_frame_free(&decoded);
@@ -996,7 +1208,7 @@ int main(int argc, char **argv) {
     /** Flush encoders */
     ret = flush_encoders(outputs);
     if (ret < 0) {
-      std::fprintf(stderr, "Flush error: %s\n", av_err2str_cpp(ret).c_str());
+      log_message("ERROR", "Flush error: %s", av_err2str_cpp(ret).c_str());
     }
 
     /** Cleanup outputs */
@@ -1006,14 +1218,20 @@ int main(int argc, char **argv) {
     avformat_close_input(&in_ctx);
 
     if (ret == AVERROR_EOF || ret == 0) {
+      if (reconnect_sec > 0) {
+        log_message("INFO", "Restarting after EOF in %d seconds...",
+                    reconnect_sec);
+        std::this_thread::sleep_for(std::chrono::seconds(reconnect_sec));
+        continue;
+      }
       exit_code = 0;
       break;
     }
 
     if (ret < 0) {
       if (reconnect_sec > 0) {
-        std::fprintf(stderr, "Stream error, reconnecting in %d seconds...\n",
-                     reconnect_sec);
+        log_message("INFO", "Stream error, reconnecting in %d seconds...",
+                    reconnect_sec);
         std::this_thread::sleep_for(std::chrono::seconds(reconnect_sec));
         continue;
       }
@@ -1028,5 +1246,7 @@ int main(int argc, char **argv) {
   }
 
   avformat_network_deinit();
+  log_message("INFO", "Exiting with code %d", exit_code);
+  log_close();
   return exit_code;
 }

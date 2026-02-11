@@ -23,4 +23,4 @@ COPY src /app/src
 RUN meson setup /app/build /app \
     && meson compile -C /app/build
 
-ENTRYPOINT ["/app/build/streamer"]
+# ENTRYPOINT ["/app/build/streamer"]
