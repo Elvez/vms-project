@@ -15,6 +15,10 @@ extern "C" {
 #include <thread>
 #include <vector>
 
+/**
+ * @brief Struct used for quality
+ * version of live stream 
+ */
 struct Rendition {
   std::string name;
   int width;
@@ -22,6 +26,11 @@ struct Rendition {
   int video_bitrate;
 };
 
+/**
+ * @brief Struct to abstract libav
+ * contexts for codec, format, scaler,
+ * frame and packet
+ */
 struct EncodeOutput {
   AVFormatContext *fmt = nullptr;
   AVStream *vstream = nullptr;
@@ -32,6 +41,11 @@ struct EncodeOutput {
   AVPacket *enc_pkt = nullptr;
 };
 
+/**
+ * @brief Print CLI usage instructions
+ * 
+ * @param argv0 
+ */
 static void print_usage(const char *argv0) {
   /** Print CLI usage */
   std::fprintf(
@@ -42,6 +56,12 @@ static void print_usage(const char *argv0) {
       argv0, argv0);
 }
 
+/**
+ * @brief Convert AVERROR to string
+ * 
+ * @param errnum 
+ * @return std::string 
+ */
 static std::string av_err2str_cpp(int errnum) {
   /** Format FFmpeg error code */
   char buf[AV_ERROR_MAX_STRING_SIZE];
@@ -49,16 +69,36 @@ static std::string av_err2str_cpp(int errnum) {
   return std::string(buf);
 }
 
+/** 
+ * @brief Check if a string starts with a given prefix
+ * 
+ * @param s The string to check
+ * @param prefix The prefix to look for
+ * @return true if the string starts with the prefix, false otherwise
+ */
 static bool starts_with(const std::string &s, const char *prefix) {
   /** Check string prefix */
   return s.rfind(prefix, 0) == 0;
 }
 
+/**
+ * @brief Is input HLS based on URL pattern
+ * 
+ * @param url 
+ * @return true 
+ * @return false 
+ */
 static bool is_hls_input(const std::string &url) {
   /** Detect HLS input by extension */
   return url.find(".m3u8") != std::string::npos;
 }
 
+/**
+ * @brief Get the base name of a file without its extension
+ * 
+ * @param path The file path
+ * @return std::string The base name without extension
+ */
 static std::string base_without_ext(const std::string &path) {
   /** Remove last extension from path */
   size_t dot = path.rfind('.');
@@ -68,6 +108,16 @@ static std::string base_without_ext(const std::string &path) {
   return path.substr(0, dot);
 }
 
+/**
+ * @brief Set the hls output options 
+ * for segment duration, list size, segment filename pattern
+ * 
+ * @param opts 
+ * @param max_keep_minutes 
+ * @param hls_time_sec 
+ * @param segment_pattern 
+ * @return int 
+ */
 static int set_hls_output_options(AVDictionary **opts, int max_keep_minutes,
                                   int hls_time_sec,
                                   const std::string &segment_pattern) {
@@ -91,6 +141,14 @@ static int set_hls_output_options(AVDictionary **opts, int max_keep_minutes,
   return 0;
 }
 
+/**
+ * @brief Open input stream with appropriate options for RTSP and HLS
+ * 
+ * @param input_url 
+ * @param rtsp_tcp 
+ * @param in_ctx 
+ * @return int 
+ */
 static int open_input(const std::string &input_url, bool rtsp_tcp,
                       AVFormatContext **in_ctx) {
   AVDictionary *opts = nullptr;
@@ -132,6 +190,16 @@ static int open_input(const std::string &input_url, bool rtsp_tcp,
   return 0;
 }
 
+/**
+ * @brief Open codec copy output context for HLS with appropriate options
+ * 
+ * @param output_path 
+ * @param in_ctx 
+ * @param out_ctx 
+ * @param max_keep_minutes 
+ * @param hls_time_sec 
+ * @return int 
+ */
 static int open_copy_output(const std::string &output_path,
                             AVFormatContext *in_ctx,
                             AVFormatContext **out_ctx, int max_keep_minutes,
@@ -192,6 +260,14 @@ static int open_copy_output(const std::string &output_path,
   return 0;
 }
 
+/**
+ * @brief Add audio stream copy to output context
+ * 
+ * @param in_ctx 
+ * @param out_ctx 
+ * @param audio_index 
+ * @return int 
+ */
 static int add_audio_stream_copy(AVFormatContext *in_ctx,
                                  AVFormatContext *out_ctx,
                                  int audio_index) {
@@ -215,6 +291,16 @@ static int add_audio_stream_copy(AVFormatContext *in_ctx,
   return 0;
 }
 
+/**
+ * @brief Initialize encoder context for a given rendition and output format
+ * 
+ * @param out The EncodeOutput structure to initialize
+ * @param rendition The rendition settings
+ * @param fps The frame rate
+ * @param global_header Whether to use a global header
+
+ * @return int 
+ */
 static int init_video_encoder(EncodeOutput &out, const Rendition &rendition,
                               AVRational fps, bool global_header) {
   /** Find H.264 encoder */
@@ -260,6 +346,19 @@ static int init_video_encoder(EncodeOutput &out, const Rendition &rendition,
   return 0;
 }
 
+/**
+ * @brief Initialize reencode output context with video encoder and HLS options
+ * 
+ * @param output_path The path to the output file
+ * @param in_ctx The input format context
+ * @param audio_index The index of the audio stream to copy
+ * @param rendition The rendition settings
+ * @param max_keep_minutes 
+ * @param hls_time_sec 
+ * @param fps 
+ * @param out 
+ * @return int 
+ */
 static int init_reencode_output(const std::string &output_path,
                                 AVFormatContext *in_ctx,
                                 int audio_index, const Rendition &rendition,
@@ -339,6 +438,13 @@ static int init_reencode_output(const std::string &output_path,
   return 0;
 }
 
+/**
+ * @brief Init software scaler context and frame for reencode output based on input frame
+ * 
+ * @param out 
+ * @param in_frame 
+ * @return int 
+ */
 static int init_sws_for_output(EncodeOutput &out, AVFrame *in_frame) {
   /** Build swscale context */
   out.sws = sws_getContext(in_frame->width, in_frame->height,
@@ -371,6 +477,14 @@ static int init_sws_for_output(EncodeOutput &out, AVFrame *in_frame) {
   return 0;
 }
 
+/**
+ * @brief Write copy packet to copy output with rescaled timestamps
+ * 
+ * @param in_ctx 
+ * @param out_ctx 
+ * @param pkt 
+ * @return int 
+ */
 static int write_copy_packet(AVFormatContext *in_ctx, AVFormatContext *out_ctx,
                              AVPacket *pkt) {
   /** Rescale timestamps and write */
@@ -398,6 +512,14 @@ static int write_copy_packet(AVFormatContext *in_ctx, AVFormatContext *out_ctx,
   return 0;
 }
 
+/**
+ * @brief Encode frame 
+ * 
+ * @param out 
+ * @param in_frame 
+ * @param pts 
+ * @return int 
+ */
 static int encode_and_write_frame(EncodeOutput &out, AVFrame *in_frame,
                                   int64_t pts) {
   /** Prepare scaled frame */
@@ -447,6 +569,16 @@ static int encode_and_write_frame(EncodeOutput &out, AVFrame *in_frame,
   return 0;
 }
 
+/**
+ * @brief Write audio packet to output context with rescaled timestamps
+ * 
+ * @param in_ctx The input format context
+ * @param out_ctx The output format context
+ * @param in_index The index of the input audio stream
+ * @param out_index The index of the output audio stream
+ * @param pkt 
+ * @return int 
+ */
 static int write_audio_packet_to_output(AVFormatContext *in_ctx,
                                         AVFormatContext *out_ctx,
                                         int in_index, int out_index,
@@ -477,6 +609,12 @@ static int write_audio_packet_to_output(AVFormatContext *in_ctx,
   return 0;
 }
 
+/**
+ * @brief Flush encoders at the end of stream to ensure all packets are written
+ * 
+ * @param outputs The list of encode outputs
+ * @return int 0 on success, negative error code on failure
+ */
 static int flush_encoders(std::vector<EncodeOutput> &outputs) {
   /** Flush each encoder */
   for (auto &out : outputs) {
@@ -510,6 +648,11 @@ static int flush_encoders(std::vector<EncodeOutput> &outputs) {
   return 0;
 }
 
+/**
+ * @brief Close copy outputs by writing trailer, closing IO and freeing context
+ * 
+ * @param out_ctx 
+ */
 static void close_copy_output(AVFormatContext *out_ctx) {
   /** Close copy output */
   if (!out_ctx) {
@@ -523,6 +666,11 @@ static void close_copy_output(AVFormatContext *out_ctx) {
   avformat_free_context(out_ctx);
 }
 
+/**
+ * @brief Close reencode outputs by flushing encoders, writing trailer, closing IO and freeing contexts
+ * 
+ * @param outputs 
+ */
 static void close_reencode_outputs(std::vector<EncodeOutput> &outputs) {
   /** Close reencoded outputs */
   for (auto &out : outputs) {
