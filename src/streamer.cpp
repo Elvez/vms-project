@@ -8,20 +8,20 @@ extern "C" {
 }
 
 #include <chrono>
-#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
 #include <inttypes.h>
-#include <ctime>
 #include <csignal>
 #include <atomic>
-#include <sys/stat.h>
 #include <string>
 #include <thread>
 #include <vector>
-#include <iostream>
+
+#include "logger.hpp"
+#include "utils.hpp"
+#include "avoptions.hpp"
 
 /**
  * @brief Struct used for quality
@@ -67,79 +67,7 @@ struct StreamState {
   AVPacket *audio_pkt = nullptr;
 };
 
-/**
- * @brief Global log file handle
- */
-static FILE *g_log = nullptr;
 static std::atomic<bool> g_stop_requested(false);
-
-/**
- * @brief Initialize log file
- *
- * @param path Log file path
- * @return true if opened, false otherwise
- */
-static bool log_init(const std::string &path) {
-  /** Open log file */
-  g_log = std::fopen(path.c_str(), "a");
-  if (!g_log) {
-    std::fprintf(stderr, "Failed to open log file: %s\n", path.c_str());
-    return false;
-  }
-
-  /** Line-buffer logs */
-  std::setvbuf(g_log, nullptr, _IOLBF, 0);
-  return true;
-}
-
-/**
- * @brief Close log file
- */
-static void log_close() {
-  /** Close log file */
-  if (!g_log) {
-    return;
-  }
-  std::fclose(g_log);
-  g_log = nullptr;
-}
-
-/**
- * @brief Log a message to file
- *
- * @param level Log level label
- * @param fmt printf-style format
- */
-static void log_message(const char *level, const char *fmt, ...) {
-  /** Skip if logger is not initialized */
-  if (!g_log) {
-    return;
-  }
-
-  /** Timestamp for logs */
-  std::time_t now = std::time(nullptr);
-  std::tm tm_buf;
-#if defined(_WIN32)
-  localtime_s(&tm_buf, &now);
-#else
-  localtime_r(&now, &tm_buf);
-#endif
-
-  char ts[32];
-  std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_buf);
-
-  std::fprintf(g_log, "[%s] %s ", level, ts);
-
-  va_list args;
-  va_start(args, fmt);
-  std::vfprintf(g_log, fmt, args);
-  std::cerr << "[" << level << "] " << ts << " ";
-  std::vfprintf(stderr, fmt, args);
-  std::cerr << std::endl;
-  va_end(args);
-
-  std::fprintf(g_log, "\n");
-}
 
 /**
  * @brief Suppress libav logging
@@ -202,11 +130,6 @@ static std::string av_err2str_cpp(int errnum) {
  * @param prefix The prefix to look for
  * @return true if the string starts with the prefix, false otherwise
  */
-static bool starts_with(const std::string &s, const char *prefix) {
-  /** Check string prefix */
-  return s.rfind(prefix, 0) == 0;
-}
-
 /**
  * @brief Check if input scheme is treated as live
  *
@@ -216,112 +139,13 @@ static bool starts_with(const std::string &s, const char *prefix) {
  */
 static bool is_live_input(const std::string &url) {
   /** RTSP/RTMP are treated as live sources */
-  return starts_with(url, "rtsp") || starts_with(url, "rtmp");
-}
-
-/**
- * @brief Is input HLS based on URL pattern
- * 
- * @param url 
- * @return true 
- * @return false 
- */
-static bool is_hls_input(const std::string &url) {
-  /** Detect HLS input by extension */
-  return url.find(".m3u8") != std::string::npos;
-}
-
-/**
- * @brief Check if a path is a directory
- *
- * @param path
- * @return true
- * @return false
- */
-static bool is_directory(const std::string &path) {
-  /** Stat the path */
-  struct stat st;
-  if (stat(path.c_str(), &st) != 0) {
-    return false;
-  }
-  return S_ISDIR(st.st_mode);
-}
-
-/**
- * @brief Normalize output path to an HLS playlist file
- *
- * @param output_path
- * @return std::string
- */
-static std::string normalize_output_path(const std::string &output_path) {
-  /** Detect directory output */
-  if (!output_path.empty() &&
-      (output_path.back() == '/' || is_directory(output_path))) {
-    std::string dir = output_path;
-    if (dir.back() != '/') {
-      dir.push_back('/');
-    }
-    return dir + "index.m3u8";
-  }
-
-  /** Ensure .m3u8 extension */
-  size_t slash = output_path.find_last_of('/');
-  size_t dot = output_path.find_last_of('.');
-  if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) {
-    return output_path + ".m3u8";
-  }
-
-  return output_path;
-}
-
-/**
- * @brief Get the base name of a file without its extension
- * 
- * @param path The file path
- * @return std::string The base name without extension
- */
-static std::string base_without_ext(const std::string &path) {
-  /** Remove last extension from path */
-  size_t dot = path.rfind('.');
-  if (dot == std::string::npos) {
-    return path;
-  }
-  return path.substr(0, dot);
-}
-
-/**
- * @brief Set the hls output options 
- * for segment duration, list size, segment filename pattern
- * 
- * @param opts 
- * @param max_keep_minutes 
- * @param hls_time_sec 
- * @param segment_pattern 
- * @return int 
- */
-static int set_hls_output_options(AVDictionary **opts, int max_keep_minutes,
-                                  int hls_time_sec,
-                                  const std::string &segment_pattern) {
-  /** Normalize inputs */
-  if (hls_time_sec > 0) {
-    /** Apply segment duration only when configured */
-    av_dict_set_int(opts, "hls_time", hls_time_sec, 0);
-  }
-
-  /** Compute list size from keep window */
-  if (hls_time_sec > 0 && max_keep_minutes > 0) {
-    int list_size = (max_keep_minutes * 60) / hls_time_sec;
-    if (list_size < 2) {
-      list_size = 2;
-    }
-    av_dict_set_int(opts, "hls_list_size", list_size, 0);
-  }
-
-  /** Apply HLS options */
-  av_dict_set(opts, "hls_flags", "delete_segments", 0);
-  av_dict_set(opts, "hls_segment_filename", segment_pattern.c_str(), 0);
-
-  return 0;
+  return utils::starts_with(
+      url,
+      "rtsp"
+  ) || utils::starts_with(
+      url,
+      "rtmp"
+  );
 }
 
 
@@ -391,7 +215,7 @@ static int open_input(const std::string &input_url, bool rtsp_tcp,
   AVDictionary *opts = nullptr;
 
   /** Apply RTSP transport and timeout options */
-  if (starts_with(input_url, "rtsp")) {
+  if (utils::starts_with(input_url, "rtsp")) {
     if (rtsp_tcp) {
       av_dict_set(&opts, "rtsp_transport", "tcp", 0);
     }
@@ -400,7 +224,7 @@ static int open_input(const std::string &input_url, bool rtsp_tcp,
   }
 
   /** Apply HTTP reconnect options for HLS and HTTP(S) inputs */
-  if (starts_with(input_url, "http") || is_hls_input(input_url)) {
+  if (utils::starts_with(input_url, "http") || is_live_input(input_url)) {
     av_dict_set(&opts, "reconnect", "1", 0);
     av_dict_set(&opts, "reconnect_streamed", "1", 0);
     av_dict_set(&opts, "reconnect_delay_max", "5", 0);
@@ -488,10 +312,16 @@ static int open_copy_output(const std::string &output_path,
 
   /** Write header with HLS options */
   AVDictionary *hls_opts = nullptr;
-  std::string base = base_without_ext(output_path);
+  std::string base = utils::base_without_ext(
+      output_path
+  );
   std::string seg_pattern = base + "_seg_%d.ts";
-  set_hls_output_options(&hls_opts, max_keep_minutes, copy_hls_time_sec,
-                         seg_pattern);
+  utils::set_hls_output_options(
+      &hls_opts,
+      max_keep_minutes,
+      copy_hls_time_sec,
+      seg_pattern
+  );
   ret = avformat_write_header(*out_ctx, &hls_opts);
   av_dict_free(&hls_opts);
   if (ret < 0) {
@@ -576,8 +406,9 @@ static int init_video_encoder(EncodeOutput &out, const Rendition &rendition,
   }
 
   /** Apply low-latency-ish tune */
-  av_opt_set(out.venc->priv_data, "preset", "veryfast", 0);
-  av_opt_set(out.venc->priv_data, "tune", "zerolatency", 0);
+  utils::set_h264_encoder_options(
+      out.venc->priv_data
+  );
 
   /** Open encoder */
   int ret = avcodec_open2(out.venc, codec, nullptr);
@@ -668,10 +499,16 @@ static int init_reencode_output(const std::string &output_path,
 
   /** Write header with HLS options */
   AVDictionary *hls_opts = nullptr;
-  std::string base = base_without_ext(output_path);
+  std::string base = utils::base_without_ext(
+      output_path
+  );
   std::string seg_pattern = base + "_seg_%d.ts";
-  set_hls_output_options(&hls_opts, max_keep_minutes, encode_hls_time_sec,
-                         seg_pattern);
+  utils::set_hls_output_options(
+      &hls_opts,
+      max_keep_minutes,
+      encode_hls_time_sec,
+      seg_pattern
+  );
   ret = avformat_write_header(out.fmt, &hls_opts);
   av_dict_free(&hls_opts);
   if (ret < 0) {
@@ -924,7 +761,9 @@ static int open_outputs(StreamState &state, const std::string &output_path,
   state.outputs.clear();
   state.outputs.reserve(renditions.size());
 
-  std::string base = base_without_ext(output_path);
+  std::string base = utils::base_without_ext(
+      output_path
+  );
   for (const auto &rendition : renditions) {
     EncodeOutput out;
     std::string path = base + "_" + rendition.name + ".m3u8";
@@ -1195,7 +1034,9 @@ int main(int argc, char **argv) {
   }
 
   /** Normalize output path */
-  output_path = normalize_output_path(output_path);
+  output_path = utils::normalize_output_path(
+      output_path
+  );
 
   /** Auto-reconnect for live inputs unless disabled */
   if (live_input && reconnect_sec <= 0) {
