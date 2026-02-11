@@ -1,9 +1,11 @@
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/avutil.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/opt.h>
-#include <libswscale/swscale.h>
+extern "C" {
+  #include <libavcodec/avcodec.h>
+  #include <libavformat/avformat.h>
+  #include <libavutil/avutil.h>
+  #include <libavutil/imgutils.h>
+  #include <libavutil/opt.h>
+  #include <libswscale/swscale.h>
+}
 
 #include <chrono>
 #include <cstdio>
@@ -27,6 +29,7 @@ struct EncodeOutput {
   AVCodecContext *venc = nullptr;
   SwsContext *sws = nullptr;
   AVFrame *sws_frame = nullptr;
+  AVPacket *enc_pkt = nullptr;
 };
 
 static void print_usage(const char *argv0) {
@@ -278,6 +281,12 @@ static int init_reencode_output(const std::string &output_path,
     return ret;
   }
 
+  /** Allocate reusable packet */
+  out.enc_pkt = av_packet_alloc();
+  if (!out.enc_pkt) {
+    return AVERROR(ENOMEM);
+  }
+
   /** Add video stream */
   out.vstream = avformat_new_stream(out.fmt, nullptr);
   if (!out.vstream) {
@@ -316,7 +325,7 @@ static int init_reencode_output(const std::string &output_path,
   /** Write header with HLS options */
   AVDictionary *hls_opts = nullptr;
   std::string base = base_without_ext(output_path);
-  std::string seg_pattern = base + \"_seg_%d.ts\";
+  std::string seg_pattern = base + "_seg_%d.ts";
   set_hls_output_options(&hls_opts, max_keep_minutes, hls_time_sec,
                          seg_pattern);
   ret = avformat_write_header(out.fmt, &hls_opts);
@@ -370,10 +379,12 @@ static int write_copy_packet(AVFormatContext *in_ctx, AVFormatContext *out_ctx,
 
   pkt->pts = av_rescale_q_rnd(pkt->pts, in_stream->time_base,
                               out_stream->time_base,
-                              AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+                              static_cast<AVRounding>(
+                                  AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
   pkt->dts = av_rescale_q_rnd(pkt->dts, in_stream->time_base,
                               out_stream->time_base,
-                              AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+                              static_cast<AVRounding>(
+                                  AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
   pkt->duration = av_rescale_q(pkt->duration, in_stream->time_base,
                                 out_stream->time_base);
   pkt->pos = -1;
@@ -408,27 +419,25 @@ static int encode_and_write_frame(EncodeOutput &out, AVFrame *in_frame,
   }
 
   /** Drain encoder packets */
+  av_packet_unref(out.enc_pkt);
   while (true) {
-    AVPacket enc_pkt;
-    av_init_packet(&enc_pkt);
-
-    ret = avcodec_receive_packet(out.venc, &enc_pkt);
+    ret = avcodec_receive_packet(out.venc, out.enc_pkt);
     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-      av_packet_unref(&enc_pkt);
       break;
     }
     if (ret < 0) {
       std::fprintf(stderr, "Encode receive error: %s\n",
                    av_err2str_cpp(ret).c_str());
-      av_packet_unref(&enc_pkt);
+      av_packet_unref(out.enc_pkt);
       return ret;
     }
 
-    enc_pkt.stream_index = out.vstream->index;
-    av_packet_rescale_ts(&enc_pkt, out.venc->time_base, out.vstream->time_base);
+    out.enc_pkt->stream_index = out.vstream->index;
+    av_packet_rescale_ts(out.enc_pkt, out.venc->time_base,
+                         out.vstream->time_base);
 
-    ret = av_interleaved_write_frame(out.fmt, &enc_pkt);
-    av_packet_unref(&enc_pkt);
+    ret = av_interleaved_write_frame(out.fmt, out.enc_pkt);
+    av_packet_unref(out.enc_pkt);
     if (ret < 0) {
       std::fprintf(stderr, "Write error: %s\n", av_err2str_cpp(ret).c_str());
       return ret;
@@ -448,10 +457,12 @@ static int write_audio_packet_to_output(AVFormatContext *in_ctx,
 
   pkt->pts = av_rescale_q_rnd(pkt->pts, in_stream->time_base,
                               out_stream->time_base,
-                              AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+                              static_cast<AVRounding>(
+                                  AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
   pkt->dts = av_rescale_q_rnd(pkt->dts, in_stream->time_base,
                               out_stream->time_base,
-                              AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+                              static_cast<AVRounding>(
+                                  AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
   pkt->duration = av_rescale_q(pkt->duration, in_stream->time_base,
                                 out_stream->time_base);
   pkt->pos = -1;
@@ -459,7 +470,7 @@ static int write_audio_packet_to_output(AVFormatContext *in_ctx,
 
   int ret = av_interleaved_write_frame(out_ctx, pkt);
   if (ret < 0) {
-    std::fprintf(stderr, \"Write audio error: %s\\n\", av_err2str_cpp(ret).c_str());
+    std::fprintf(stderr, "Write audio error: %s\n", av_err2str_cpp(ret).c_str());
     return ret;
   }
 
@@ -475,24 +486,21 @@ static int flush_encoders(std::vector<EncodeOutput> &outputs) {
     }
 
     while (true) {
-      AVPacket enc_pkt;
-      av_init_packet(&enc_pkt);
-
-      ret = avcodec_receive_packet(out.venc, &enc_pkt);
+      ret = avcodec_receive_packet(out.venc, out.enc_pkt);
       if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-        av_packet_unref(&enc_pkt);
         break;
       }
       if (ret < 0) {
-        av_packet_unref(&enc_pkt);
+        av_packet_unref(out.enc_pkt);
         return ret;
       }
 
-      enc_pkt.stream_index = out.vstream->index;
-      av_packet_rescale_ts(&enc_pkt, out.venc->time_base, out.vstream->time_base);
+      out.enc_pkt->stream_index = out.vstream->index;
+      av_packet_rescale_ts(out.enc_pkt, out.venc->time_base,
+                           out.vstream->time_base);
 
-      ret = av_interleaved_write_frame(out.fmt, &enc_pkt);
-      av_packet_unref(&enc_pkt);
+      ret = av_interleaved_write_frame(out.fmt, out.enc_pkt);
+      av_packet_unref(out.enc_pkt);
       if (ret < 0) {
         return ret;
       }
@@ -537,6 +545,10 @@ static void close_reencode_outputs(std::vector<EncodeOutput> &outputs) {
 
     if (out.sws) {
       sws_freeContext(out.sws);
+    }
+
+    if (out.enc_pkt) {
+      av_packet_free(&out.enc_pkt);
     }
   }
 }
@@ -698,12 +710,26 @@ int main(int argc, char **argv) {
 
     /** Decode and transcode loop */
     {
-      AVPacket pkt;
-      av_init_packet(&pkt);
+      AVPacket *pkt = av_packet_alloc();
+      if (!pkt) {
+        std::fprintf(stderr, "Failed to allocate packet\n");
+        exit_code = 5;
+        goto cleanup_loop;
+      }
+
+      AVPacket *audio_pkt = av_packet_alloc();
+      if (!audio_pkt) {
+        std::fprintf(stderr, "Failed to allocate audio packet\n");
+        av_packet_free(&pkt);
+        exit_code = 5;
+        goto cleanup_loop;
+      }
 
       AVFrame *decoded = av_frame_alloc();
       if (!decoded) {
         std::fprintf(stderr, "Failed to allocate decode frame\n");
+        av_packet_free(&audio_pkt);
+        av_packet_free(&pkt);
         exit_code = 5;
         goto cleanup_loop;
       }
@@ -711,7 +737,7 @@ int main(int argc, char **argv) {
       int64_t fallback_pts = 0;
 
       while (true) {
-        ret = av_read_frame(in_ctx, &pkt);
+        ret = av_read_frame(in_ctx, pkt);
         if (ret == AVERROR_EOF) {
           break;
         }
@@ -721,12 +747,12 @@ int main(int argc, char **argv) {
         }
 
         /** Decode video for renditions */
-        if (pkt.stream_index == video_index) {
-          ret = avcodec_send_packet(vdec, &pkt);
+        if (pkt->stream_index == video_index) {
+          ret = avcodec_send_packet(vdec, pkt);
           if (ret < 0) {
             std::fprintf(stderr, "Decode send error: %s\n",
                          av_err2str_cpp(ret).c_str());
-            av_packet_unref(&pkt);
+            av_packet_unref(pkt);
             break;
           }
 
@@ -774,48 +800,49 @@ int main(int argc, char **argv) {
             }
           }
           if (ret < 0) {
-            av_packet_unref(&pkt);
+            av_packet_unref(pkt);
             break;
           }
         }
 
         /** Write audio packets to rendition outputs */
-        if (audio_index >= 0 && pkt.stream_index == audio_index) {
+        if (audio_index >= 0 && pkt->stream_index == audio_index) {
           for (auto &out : outputs) {
             if (!out.astream) {
               continue;
             }
-            AVPacket audio_pkt;
-            av_init_packet(&audio_pkt);
-            ret = av_packet_ref(&audio_pkt, &pkt);
+            av_packet_unref(audio_pkt);
+            ret = av_packet_ref(audio_pkt, pkt);
             if (ret < 0) {
               break;
             }
 
             ret = write_audio_packet_to_output(in_ctx, out.fmt, audio_index,
-                                               out.astream->index, &audio_pkt);
-            av_packet_unref(&audio_pkt);
+                                               out.astream->index, audio_pkt);
+            av_packet_unref(audio_pkt);
             if (ret < 0) {
               break;
             }
           }
           if (ret < 0) {
-            av_packet_unref(&pkt);
+            av_packet_unref(pkt);
             break;
           }
         }
 
         /** Write copy output */
-        ret = write_copy_packet(in_ctx, copy_ctx, &pkt);
+        ret = write_copy_packet(in_ctx, copy_ctx, pkt);
         if (ret < 0) {
-          av_packet_unref(&pkt);
+          av_packet_unref(pkt);
           break;
         }
 
-        av_packet_unref(&pkt);
+        av_packet_unref(pkt);
       }
 
       av_frame_free(&decoded);
+      av_packet_free(&audio_pkt);
+      av_packet_free(&pkt);
     }
 
     /** Flush encoders */
