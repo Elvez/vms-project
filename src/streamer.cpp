@@ -15,10 +15,13 @@ extern "C" {
 #include <cerrno>
 #include <inttypes.h>
 #include <ctime>
+#include <csignal>
+#include <atomic>
 #include <sys/stat.h>
 #include <string>
 #include <thread>
 #include <vector>
+#include <iostream>
 
 /**
  * @brief Struct used for quality
@@ -47,9 +50,28 @@ struct EncodeOutput {
 };
 
 /**
+ * @brief Aggregated runtime state for a streaming session
+ */
+struct StreamState {
+  AVFormatContext *in_ctx = nullptr;
+  AVFormatContext *copy_ctx = nullptr;
+  AVCodecContext *vdec = nullptr;
+  AVStream *video_stream = nullptr;
+  int video_index = -1;
+  int audio_index = -1;
+  int64_t fallback_pts = 0;
+  int64_t packet_count = 0;
+  std::vector<int64_t> copy_next_pts;
+  std::vector<EncodeOutput> outputs;
+  AVFrame *decoded = nullptr;
+  AVPacket *audio_pkt = nullptr;
+};
+
+/**
  * @brief Global log file handle
  */
 static FILE *g_log = nullptr;
+static std::atomic<bool> g_stop_requested(false);
 
 /**
  * @brief Initialize log file
@@ -111,6 +133,9 @@ static void log_message(const char *level, const char *fmt, ...) {
   va_list args;
   va_start(args, fmt);
   std::vfprintf(g_log, fmt, args);
+  std::cerr << "[" << level << "] " << ts << " ";
+  std::vfprintf(stderr, fmt, args);
+  std::cerr << std::endl;
   va_end(args);
 
   std::fprintf(g_log, "\n");
@@ -129,6 +154,17 @@ static void quiet_av_log_callback(void *ptr, int level, const char *fmt,
 }
 
 /**
+ * @brief Signal handler for graceful shutdown
+ *
+ * @param signum
+ */
+static void handle_signal(int signum) {
+  /** Request stop */
+  (void)signum;
+  g_stop_requested.store(true);
+}
+
+/**
  * @brief Print CLI usage instructions
  * 
  * @param argv0 
@@ -138,7 +174,9 @@ static void print_usage(const char *argv0) {
   std::fprintf(
       stderr,
       "Usage: %s <input_url> <output_path> [--rtsp-tcp] [--reconnect-sec N] "
-      "[--max-keep-minutes M] [--hls-time S] [--log-file PATH]\n"
+      "[--copy-max-keep-minutes M] [--encode-max-keep-minutes M] "
+      "[--copy-hls-time S] [--encode-hls-time S] "
+      "[--log-file PATH]\n"
       "Note: If output_path is a directory, index.m3u8 is created inside.\n"
       "Example: %s rtsp://cam/stream out.m3u8 --max-keep-minutes 5\n",
       argv0, argv0);
@@ -265,23 +303,79 @@ static int set_hls_output_options(AVDictionary **opts, int max_keep_minutes,
                                   int hls_time_sec,
                                   const std::string &segment_pattern) {
   /** Normalize inputs */
-  if (hls_time_sec <= 0) {
-    hls_time_sec = 4;
+  if (hls_time_sec > 0) {
+    /** Apply segment duration only when configured */
+    av_dict_set_int(opts, "hls_time", hls_time_sec, 0);
   }
 
   /** Compute list size from keep window */
-  int list_size = (max_keep_minutes * 60) / hls_time_sec;
-  if (list_size < 2) {
-    list_size = 2;
+  if (hls_time_sec > 0 && max_keep_minutes > 0) {
+    int list_size = (max_keep_minutes * 60) / hls_time_sec;
+    if (list_size < 2) {
+      list_size = 2;
+    }
+    av_dict_set_int(opts, "hls_list_size", list_size, 0);
   }
 
   /** Apply HLS options */
-  av_dict_set_int(opts, "hls_time", hls_time_sec, 0);
-  av_dict_set_int(opts, "hls_list_size", list_size, 0);
-  av_dict_set(opts, "hls_flags", "delete_segments+omit_endlist", 0);
+  av_dict_set(opts, "hls_flags", "delete_segments", 0);
   av_dict_set(opts, "hls_segment_filename", segment_pattern.c_str(), 0);
 
   return 0;
+}
+
+
+/**
+ * @brief Close copy outputs by writing trailer, closing IO and freeing context
+ * 
+ * @param out_ctx 
+ */
+static void close_copy_output(AVFormatContext *out_ctx) {
+  /** Close copy output */
+  if (!out_ctx) {
+    return;
+  }
+
+  av_write_trailer(out_ctx);
+  if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) {
+    avio_closep(&out_ctx->pb);
+  }
+  avformat_free_context(out_ctx);
+}
+
+/**
+ * @brief Close reencode outputs by flushing encoders, writing trailer, closing IO and freeing contexts
+ * 
+ * @param outputs 
+ */
+static void close_reencode_outputs(std::vector<EncodeOutput> &outputs) {
+  /** Close reencoded outputs */
+  for (auto &out : outputs) {
+    if (out.fmt) {
+      av_write_trailer(out.fmt);
+      if (!(out.fmt->oformat->flags & AVFMT_NOFILE)) {
+        avio_closep(&out.fmt->pb);
+      }
+      avformat_free_context(out.fmt);
+      out.fmt = nullptr;
+    }
+
+    if (out.venc) {
+      avcodec_free_context(&out.venc);
+    }
+
+    if (out.sws_frame) {
+      av_frame_free(&out.sws_frame);
+    }
+
+    if (out.sws) {
+      sws_freeContext(out.sws);
+    }
+
+    if (out.enc_pkt) {
+      av_packet_free(&out.enc_pkt);
+    }
+  }
 }
 
 /**
@@ -352,7 +446,7 @@ static int open_input(const std::string &input_url, bool rtsp_tcp,
 static int open_copy_output(const std::string &output_path,
                             AVFormatContext *in_ctx,
                             AVFormatContext **out_ctx, int max_keep_minutes,
-                            int hls_time_sec) {
+                            int copy_hls_time_sec) {
   /** Create output context (HLS) */
   int ret = avformat_alloc_output_context2(out_ctx, nullptr, "hls",
                                            output_path.c_str());
@@ -396,7 +490,7 @@ static int open_copy_output(const std::string &output_path,
   AVDictionary *hls_opts = nullptr;
   std::string base = base_without_ext(output_path);
   std::string seg_pattern = base + "_seg_%d.ts";
-  set_hls_output_options(&hls_opts, max_keep_minutes, hls_time_sec,
+  set_hls_output_options(&hls_opts, max_keep_minutes, copy_hls_time_sec,
                          seg_pattern);
   ret = avformat_write_header(*out_ctx, &hls_opts);
   av_dict_free(&hls_opts);
@@ -512,7 +606,7 @@ static int init_video_encoder(EncodeOutput &out, const Rendition &rendition,
 static int init_reencode_output(const std::string &output_path,
                                 AVFormatContext *in_ctx,
                                 int audio_index, const Rendition &rendition,
-                                int max_keep_minutes, int hls_time_sec,
+                                int max_keep_minutes, int encode_hls_time_sec,
                                 AVRational fps, EncodeOutput &out) {
   /** Create output context (HLS) */
   int ret = avformat_alloc_output_context2(&out.fmt, nullptr, "hls",
@@ -576,7 +670,7 @@ static int init_reencode_output(const std::string &output_path,
   AVDictionary *hls_opts = nullptr;
   std::string base = base_without_ext(output_path);
   std::string seg_pattern = base + "_seg_%d.ts";
-  set_hls_output_options(&hls_opts, max_keep_minutes, hls_time_sec,
+  set_hls_output_options(&hls_opts, max_keep_minutes, encode_hls_time_sec,
                          seg_pattern);
   ret = avformat_write_header(out.fmt, &hls_opts);
   av_dict_free(&hls_opts);
@@ -723,6 +817,44 @@ static int encode_and_write_frame(EncodeOutput &out, AVFrame *in_frame,
 }
 
 /**
+ * @brief Normalize packet timestamps for copy output
+ *
+ * @param state
+ * @param pkt
+ */
+static void normalize_copy_timestamps(StreamState &state, AVPacket *pkt) {
+  /** Skip if no stream state */
+  if (pkt->stream_index < 0 ||
+      pkt->stream_index >= static_cast<int>(state.copy_next_pts.size())) {
+    return;
+  }
+
+  /** Fill missing timestamps */
+  if (pkt->pts == AV_NOPTS_VALUE && pkt->dts == AV_NOPTS_VALUE) {
+    int64_t next = state.copy_next_pts[pkt->stream_index];
+    pkt->pts = next;
+    pkt->dts = next;
+  } else if (pkt->pts == AV_NOPTS_VALUE) {
+    pkt->pts = pkt->dts;
+  } else if (pkt->dts == AV_NOPTS_VALUE) {
+    pkt->dts = pkt->pts;
+  }
+
+  /** Enforce monotonic DTS */
+  int64_t next = state.copy_next_pts[pkt->stream_index];
+  if (pkt->dts < next) {
+    pkt->dts = next;
+  }
+  if (pkt->pts < pkt->dts) {
+    pkt->pts = pkt->dts;
+  }
+
+  /** Advance next PTS */
+  int64_t inc = pkt->duration > 0 ? pkt->duration : 1;
+  state.copy_next_pts[pkt->stream_index] = pkt->dts + inc;
+}
+
+/**
  * @brief Write audio packet to output context with rescaled timestamps
  * 
  * @param in_ctx The input format context
@@ -760,6 +892,210 @@ static int write_audio_packet_to_output(AVFormatContext *in_ctx,
   }
 
   return 0;
+}
+
+/**
+ * @brief Open copy and reencode outputs
+ *
+ * @param state
+ * @param output_path
+ * @param renditions
+ * @param max_keep_minutes
+ * @param hls_time_sec
+ * @return int
+ */
+static int open_outputs(StreamState &state, const std::string &output_path,
+                        const std::vector<Rendition> &renditions,
+                        int copy_max_keep_minutes, int copy_hls_time_sec,
+                        int encode_max_keep_minutes, int encode_hls_time_sec) {
+  /** Open copy output */
+  int ret = open_copy_output(output_path, state.in_ctx, &state.copy_ctx,
+                             copy_max_keep_minutes, copy_hls_time_sec);
+  if (ret < 0) {
+    return ret;
+  }
+
+  /** Initialize renditions */
+  AVRational fps = av_guess_frame_rate(state.in_ctx, state.video_stream, nullptr);
+  if (fps.num <= 0 || fps.den <= 0) {
+    fps = {30, 1};
+  }
+
+  state.outputs.clear();
+  state.outputs.reserve(renditions.size());
+
+  std::string base = base_without_ext(output_path);
+  for (const auto &rendition : renditions) {
+    EncodeOutput out;
+    std::string path = base + "_" + rendition.name + ".m3u8";
+
+    ret = init_reencode_output(path, state.in_ctx, state.audio_index, rendition,
+                               encode_max_keep_minutes, encode_hls_time_sec,
+                               fps, out);
+    if (ret < 0) {
+      close_copy_output(state.copy_ctx);
+      state.copy_ctx = nullptr;
+      close_reencode_outputs(state.outputs);
+      return ret;
+    }
+
+    state.outputs.push_back(out);
+  }
+
+  /** Initialize copy timestamp tracking */
+  state.copy_next_pts.assign(state.in_ctx->nb_streams, 0);
+
+  return 0;
+}
+
+/**
+ * @brief Distribute packet to copy and reencode outputs
+ *
+ * @param state
+ * @param pkt
+ * @return int
+ */
+static int distribute_outputs(StreamState &state, AVPacket *pkt) {
+  /** Decode video for renditions */
+  if (pkt->stream_index == state.video_index) {
+    int ret = avcodec_send_packet(state.vdec, pkt);
+    if (ret < 0) {
+      log_message("ERROR", "Decode send error: %s",
+                  av_err2str_cpp(ret).c_str());
+      return ret;
+    }
+
+    while (true) {
+      ret = avcodec_receive_frame(state.vdec, state.decoded);
+      if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        break;
+      }
+      if (ret < 0) {
+        log_message("ERROR", "Decode receive error: %s",
+                    av_err2str_cpp(ret).c_str());
+        return ret;
+      }
+
+      /** Initialize sws once we have the first frame */
+      for (auto &out : state.outputs) {
+        if (!out.sws) {
+          ret = init_sws_for_output(out, state.decoded);
+          if (ret < 0) {
+            log_message("ERROR", "Init sws error: %s",
+                        av_err2str_cpp(ret).c_str());
+            return ret;
+          }
+        }
+      }
+
+      /** Derive PTS for encoder timebase */
+      int64_t in_pts = state.decoded->best_effort_timestamp;
+      if (in_pts == AV_NOPTS_VALUE) {
+        in_pts = state.fallback_pts++;
+      }
+
+      /** Encode all renditions */
+      for (auto &out : state.outputs) {
+        int64_t enc_pts = av_rescale_q(in_pts, state.video_stream->time_base,
+                                       out.venc->time_base);
+        ret = encode_and_write_frame(out, state.decoded, enc_pts);
+        if (ret < 0) {
+          log_message("ERROR", "Encode/write error: %s",
+                      av_err2str_cpp(ret).c_str());
+          return ret;
+        }
+      }
+    }
+  }
+
+  /** Write audio packets to rendition outputs */
+  if (state.audio_index >= 0 && pkt->stream_index == state.audio_index) {
+    for (auto &out : state.outputs) {
+      if (!out.astream) {
+        continue;
+      }
+      av_packet_unref(state.audio_pkt);
+      int ret = av_packet_ref(state.audio_pkt, pkt);
+      if (ret < 0) {
+        log_message("ERROR", "Audio packet ref error: %s",
+                    av_err2str_cpp(ret).c_str());
+        return ret;
+      }
+
+      ret = write_audio_packet_to_output(state.in_ctx, out.fmt, state.audio_index,
+                                         out.astream->index, state.audio_pkt);
+      av_packet_unref(state.audio_pkt);
+      if (ret < 0) {
+        log_message("ERROR", "Audio write error: %s",
+                    av_err2str_cpp(ret).c_str());
+        return ret;
+      }
+    }
+  }
+
+  /** Write copy output */
+  normalize_copy_timestamps(state, pkt);
+  int ret = write_copy_packet(state.in_ctx, state.copy_ctx, pkt);
+  if (ret < 0) {
+    log_message("ERROR", "Copy write error: %s", av_err2str_cpp(ret).c_str());
+    return ret;
+  }
+
+  return 0;
+}
+
+/**
+ * @brief Read packets and distribute to outputs
+ *
+ * @param state
+ * @return int
+ */
+static int run_loop(StreamState &state) {
+  /** Allocate packet for reading */
+  AVPacket *pkt = av_packet_alloc();
+  if (!pkt) {
+    log_message("ERROR", "Failed to allocate packet");
+    return AVERROR(ENOMEM);
+  }
+
+  int ret = 0;
+  while (true) {
+    if (g_stop_requested.load()) {
+      log_message("INFO", "Stop requested, ending loop");
+      ret = AVERROR_EXIT;
+      break;
+    }
+
+    ret = av_read_frame(state.in_ctx, pkt);
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR(ETIMEDOUT)) {
+      log_message("WARN", "Read timeout, retrying...");
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      continue;
+    }
+    if (ret == AVERROR_EOF) {
+      log_message("WARN", "Input reached EOF");
+      break;
+    }
+    if (ret < 0) {
+      log_message("ERROR", "Read error: %s", av_err2str_cpp(ret).c_str());
+      break;
+    }
+
+    ret = distribute_outputs(state, pkt);
+    av_packet_unref(pkt);
+    if (ret < 0) {
+      break;
+    }
+
+    state.packet_count++;
+    if (state.packet_count % 300 == 0) {
+      log_message("INFO", "Processed %" PRId64 " packets",
+                  state.packet_count);
+    }
+  }
+
+  av_packet_free(&pkt);
+  return ret;
 }
 
 /**
@@ -806,59 +1142,6 @@ static int flush_encoders(std::vector<EncodeOutput> &outputs) {
   return 0;
 }
 
-/**
- * @brief Close copy outputs by writing trailer, closing IO and freeing context
- * 
- * @param out_ctx 
- */
-static void close_copy_output(AVFormatContext *out_ctx) {
-  /** Close copy output */
-  if (!out_ctx) {
-    return;
-  }
-
-  av_write_trailer(out_ctx);
-  if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) {
-    avio_closep(&out_ctx->pb);
-  }
-  avformat_free_context(out_ctx);
-}
-
-/**
- * @brief Close reencode outputs by flushing encoders, writing trailer, closing IO and freeing contexts
- * 
- * @param outputs 
- */
-static void close_reencode_outputs(std::vector<EncodeOutput> &outputs) {
-  /** Close reencoded outputs */
-  for (auto &out : outputs) {
-    if (out.fmt) {
-      av_write_trailer(out.fmt);
-      if (!(out.fmt->oformat->flags & AVFMT_NOFILE)) {
-        avio_closep(&out.fmt->pb);
-      }
-      avformat_free_context(out.fmt);
-      out.fmt = nullptr;
-    }
-
-    if (out.venc) {
-      avcodec_free_context(&out.venc);
-    }
-
-    if (out.sws_frame) {
-      av_frame_free(&out.sws_frame);
-    }
-
-    if (out.sws) {
-      sws_freeContext(out.sws);
-    }
-
-    if (out.enc_pkt) {
-      av_packet_free(&out.enc_pkt);
-    }
-  }
-}
-
 int main(int argc, char **argv) {
   if (argc < 3) {
     print_usage(argv[0]);
@@ -871,8 +1154,10 @@ int main(int argc, char **argv) {
   std::string log_file = "streamer.log";
   bool rtsp_tcp = false;
   int reconnect_sec = 0;
-  int max_keep_minutes = 5;
-  int hls_time_sec = 4;
+  int copy_max_keep_minutes = 0;
+  int encode_max_keep_minutes = 5;
+  int copy_hls_time_sec = 0;
+  int encode_hls_time_sec = 4;
   bool live_input = is_live_input(input_url);
 
   /** Parse CLI */
@@ -882,11 +1167,17 @@ int main(int argc, char **argv) {
     } else if (std::strcmp(argv[i], "--reconnect-sec") == 0 && i + 1 < argc) {
       reconnect_sec = std::atoi(argv[i + 1]);
       ++i;
-    } else if (std::strcmp(argv[i], "--max-keep-minutes") == 0 && i + 1 < argc) {
-      max_keep_minutes = std::atoi(argv[i + 1]);
+    } else if (std::strcmp(argv[i], "--copy-max-keep-minutes") == 0 && i + 1 < argc) {
+      copy_max_keep_minutes = std::atoi(argv[i + 1]);
       ++i;
-    } else if (std::strcmp(argv[i], "--hls-time") == 0 && i + 1 < argc) {
-      hls_time_sec = std::atoi(argv[i + 1]);
+    } else if (std::strcmp(argv[i], "--encode-max-keep-minutes") == 0 && i + 1 < argc) {
+      encode_max_keep_minutes = std::atoi(argv[i + 1]);
+      ++i;
+    } else if (std::strcmp(argv[i], "--copy-hls-time") == 0 && i + 1 < argc) {
+      copy_hls_time_sec = std::atoi(argv[i + 1]);
+      ++i;
+    } else if (std::strcmp(argv[i], "--encode-hls-time") == 0 && i + 1 < argc) {
+      encode_hls_time_sec = std::atoi(argv[i + 1]);
       ++i;
     } else if (std::strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
       log_file = argv[i + 1];
@@ -916,6 +1207,10 @@ int main(int argc, char **argv) {
   log_message("INFO", "Output HLS: %s", output_path.c_str());
   log_message("INFO", "Log file: %s", log_file.c_str());
   log_message("INFO", "Reconnect seconds: %d", reconnect_sec);
+  log_message("INFO", "Copy max keep minutes: %d", copy_max_keep_minutes);
+  log_message("INFO", "Encode max keep minutes: %d", encode_max_keep_minutes);
+  log_message("INFO", "Copy HLS time: %d", copy_hls_time_sec);
+  log_message("INFO", "Encode HLS time: %d", encode_hls_time_sec);
 
   /** Static ladder for low/mid/high */
   std::vector<Rendition> renditions = {
@@ -929,11 +1224,20 @@ int main(int argc, char **argv) {
   av_log_set_callback(quiet_av_log_callback);
   avformat_network_init();
 
+  /** Install signal handlers */
+  std::signal(SIGINT, handle_signal);
+  std::signal(SIGTERM, handle_signal);
+
   /** Reconnect loop */
   int exit_code = 0;
   while (true) {
+    if (g_stop_requested.load()) {
+      log_message("INFO", "Stop requested, shutting down");
+      exit_code = 0;
+      break;
+    }
+
     AVFormatContext *in_ctx = nullptr;
-    AVFormatContext *copy_ctx = nullptr;
 
     /** Open input */
     int ret = open_input(input_url, rtsp_tcp, &in_ctx);
@@ -999,13 +1303,19 @@ int main(int argc, char **argv) {
       break;
     }
 
-    /** Prepare output paths */
-    std::string base = base_without_ext(output_path);
-    std::string copy_path = output_path;
+    /** Prepare stream state */
+    StreamState state;
+    state.in_ctx = in_ctx;
+    state.copy_ctx = nullptr;
+    state.vdec = vdec;
+    state.video_stream = video_stream;
+    state.video_index = video_index;
+    state.audio_index = audio_index;
 
-    /** Open copy HLS output */
-    ret = open_copy_output(copy_path, in_ctx, &copy_ctx, max_keep_minutes,
-                           hls_time_sec);
+    /** Open outputs */
+    ret = open_outputs(state, output_path, renditions,
+                       copy_max_keep_minutes, copy_hls_time_sec,
+                       encode_max_keep_minutes, encode_hls_time_sec);
     if (ret < 0) {
       avcodec_free_context(&vdec);
       avformat_close_input(&in_ctx);
@@ -1013,212 +1323,58 @@ int main(int argc, char **argv) {
       break;
     }
 
-    /** Initialize renditions */
-    AVRational fps = av_guess_frame_rate(in_ctx, video_stream, nullptr);
-    if (fps.num <= 0 || fps.den <= 0) {
-      fps = {30, 1};
+    /** Allocate shared decode resources */
+    state.decoded = av_frame_alloc();
+    if (!state.decoded) {
+      log_message("ERROR", "Failed to allocate decode frame");
+      close_copy_output(state.copy_ctx);
+      close_reencode_outputs(state.outputs);
+      avcodec_free_context(&vdec);
+      avformat_close_input(&in_ctx);
+      exit_code = 5;
+      break;
     }
 
-    std::vector<EncodeOutput> outputs;
-    outputs.reserve(renditions.size());
-
-    for (const auto &rendition : renditions) {
-      EncodeOutput out;
-      std::string path = base + "_" + rendition.name + ".m3u8";
-
-      ret = init_reencode_output(path, in_ctx, audio_index, rendition,
-                                 max_keep_minutes, hls_time_sec, fps, out);
-      if (ret < 0) {
-        close_copy_output(copy_ctx);
-        close_reencode_outputs(outputs);
-        avcodec_free_context(&vdec);
-        avformat_close_input(&in_ctx);
-        exit_code = 4;
-        goto cleanup_loop;
-      }
-
-      outputs.push_back(out);
+    state.audio_pkt = av_packet_alloc();
+    if (!state.audio_pkt) {
+      log_message("ERROR", "Failed to allocate audio packet");
+      av_frame_free(&state.decoded);
+      close_copy_output(state.copy_ctx);
+      close_reencode_outputs(state.outputs);
+      avcodec_free_context(&vdec);
+      avformat_close_input(&in_ctx);
+      exit_code = 5;
+      break;
     }
 
-    /** Decode and transcode loop */
-    {
-      AVPacket *pkt = av_packet_alloc();
-      if (!pkt) {
-        log_message("ERROR", "Failed to allocate packet");
-        exit_code = 5;
-        goto cleanup_loop;
-      }
+    /** Read and distribute packets */
+    ret = run_loop(state);
 
-      AVPacket *audio_pkt = av_packet_alloc();
-      if (!audio_pkt) {
-        log_message("ERROR", "Failed to allocate audio packet");
-        av_packet_free(&pkt);
-        exit_code = 5;
-        goto cleanup_loop;
-      }
-
-      AVFrame *decoded = av_frame_alloc();
-      if (!decoded) {
-        log_message("ERROR", "Failed to allocate decode frame");
-        av_packet_free(&audio_pkt);
-        av_packet_free(&pkt);
-        exit_code = 5;
-        goto cleanup_loop;
-      }
-
-      int64_t fallback_pts = 0;
-
-      int64_t frame_count = 0;
-      while (true) {
-        ret = av_read_frame(in_ctx, pkt);
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR(ETIMEDOUT)) {
-          log_message("WARN", "Read timeout, retrying...");
-          std::this_thread::sleep_for(std::chrono::seconds(1));
-          continue;
-        }
-        if (ret == AVERROR_EOF) {
-          log_message("WARN", "Input reached EOF");
-          break;
-        }
-        if (ret < 0) {
-          log_message("ERROR", "Read error: %s", av_err2str_cpp(ret).c_str());
-          break;
-        }
-
-        log_message("DEBUG", "Read packet from stream %d, size %d, pts %" PRId64,
-                    pkt->stream_index, pkt->size, pkt->pts);
-
-        /** Decode video for renditions */
-        if (pkt->stream_index == video_index) {
-          ret = avcodec_send_packet(vdec, pkt);
-          if (ret < 0) {
-            log_message("ERROR", "Decode send error: %s",
-                        av_err2str_cpp(ret).c_str());
-            av_packet_unref(pkt);
-            break;
-          }
-
-          while (true) {
-            ret = avcodec_receive_frame(vdec, decoded);
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-              break;
-            }
-            if (ret < 0) {
-              log_message("ERROR", "Decode receive error: %s",
-                          av_err2str_cpp(ret).c_str());
-              break;
-            }
-
-            /** Initialize sws once we have the first frame */
-            for (auto &out : outputs) {
-              if (!out.sws) {
-                ret = init_sws_for_output(out, decoded);
-                if (ret < 0) {
-                  log_message("ERROR", "Init sws error: %s",
-                              av_err2str_cpp(ret).c_str());
-                  break;
-                }
-              }
-            }
-            if (ret < 0) {
-              log_message("ERROR", "Audio packet ref error: %s",
-                          av_err2str_cpp(ret).c_str());
-              break;
-            }
-
-            /** Derive PTS for encoder timebase */
-            int64_t in_pts = decoded->best_effort_timestamp;
-            if (in_pts == AV_NOPTS_VALUE) {
-              in_pts = fallback_pts++;
-            }
-
-            /** Encode all renditions */
-            for (auto &out : outputs) {
-              int64_t enc_pts = av_rescale_q(in_pts, video_stream->time_base,
-                                             out.venc->time_base);
-              ret = encode_and_write_frame(out, decoded, enc_pts);
-              if (ret < 0) {
-                log_message("ERROR", "encode and write error: %s",
-                          av_err2str_cpp(ret).c_str());
-                break;
-              }
-            }
-            if (ret < 0) {
-              log_message("ERROR", "Audio write error: %s",
-                          av_err2str_cpp(ret).c_str());
-              break;
-            }
-          }
-          if (ret < 0) {
-            log_message("ERROR", "in loop: %s",
-                          av_err2str_cpp(ret).c_str());
-            av_packet_unref(pkt);
-            break;
-          }
-        }
-
-        /** Write audio packets to rendition outputs */
-        if (audio_index >= 0 && pkt->stream_index == audio_index) {
-          for (auto &out : outputs) {
-            if (!out.astream) {
-              continue;
-            }
-            av_packet_unref(audio_pkt);
-            ret = av_packet_ref(audio_pkt, pkt);
-            if (ret < 0) {
-              break;
-            }
-
-            ret = write_audio_packet_to_output(in_ctx, out.fmt, audio_index,
-                                               out.astream->index, audio_pkt);
-            av_packet_unref(audio_pkt);
-            if (ret < 0) {
-              break;
-            }
-          }
-          if (ret < 0) {
-            av_packet_unref(pkt);
-            break;
-          }
-        }
-
-        /** Write copy output */
-        ret = write_copy_packet(in_ctx, copy_ctx, pkt);
-        if (ret < 0) {
-          log_message("ERROR", "Copy write error: %s",
-                      av_err2str_cpp(ret).c_str());
-          av_packet_unref(pkt);
-          break;
-        }
-
-        av_packet_unref(pkt);
-
-        /** Periodic progress log */
-        frame_count++;
-        if (frame_count % 300 == 0) {
-          log_message("INFO", "Processed %" PRId64 " packets", frame_count);
-        }
-      }
-
-      av_frame_free(&decoded);
-      av_packet_free(&audio_pkt);
-      av_packet_free(&pkt);
-    }
+    av_packet_free(&state.audio_pkt);
+    av_frame_free(&state.decoded);
 
     /** Flush encoders */
-    ret = flush_encoders(outputs);
+    ret = flush_encoders(state.outputs);
     if (ret < 0) {
       log_message("ERROR", "Flush error: %s", av_err2str_cpp(ret).c_str());
     }
 
     /** Cleanup outputs */
-    close_copy_output(copy_ctx);
-    close_reencode_outputs(outputs);
+    close_copy_output(state.copy_ctx);
+    close_reencode_outputs(state.outputs);
     avcodec_free_context(&vdec);
     avformat_close_input(&in_ctx);
 
+    if (ret == AVERROR_EXIT) {
+      exit_code = 0;
+      break;
+    }
     if (ret == AVERROR_EOF || ret == 0) {
       if (reconnect_sec > 0) {
+        if (g_stop_requested.load()) {
+          exit_code = 0;
+          break;
+        }
         log_message("INFO", "Restarting after EOF in %d seconds...",
                     reconnect_sec);
         std::this_thread::sleep_for(std::chrono::seconds(reconnect_sec));
@@ -1230,6 +1386,10 @@ int main(int argc, char **argv) {
 
     if (ret < 0) {
       if (reconnect_sec > 0) {
+        if (g_stop_requested.load()) {
+          exit_code = 0;
+          break;
+        }
         log_message("INFO", "Stream error, reconnecting in %d seconds...",
                     reconnect_sec);
         std::this_thread::sleep_for(std::chrono::seconds(reconnect_sec));
@@ -1239,7 +1399,6 @@ int main(int argc, char **argv) {
       break;
     }
 
-  cleanup_loop:
     if (exit_code != 0) {
       break;
     }
