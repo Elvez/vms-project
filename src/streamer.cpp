@@ -224,7 +224,7 @@ static int open_input(const std::string &input_url, bool rtsp_tcp,
   }
 
   /** Apply HTTP reconnect options for HLS and HTTP(S) inputs */
-  if (utils::starts_with(input_url, "http") || is_live_input(input_url)) {
+  if (utils::starts_with(input_url, "http") || utils::starts_with(input_url, "https")) {
     av_dict_set(&opts, "reconnect", "1", 0);
     av_dict_set(&opts, "reconnect_streamed", "1", 0);
     av_dict_set(&opts, "reconnect_delay_max", "5", 0);
