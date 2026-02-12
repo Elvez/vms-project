@@ -54,7 +54,7 @@ npm run dev -- --host --port 5173
 ## Frontend media placeholders
 - Home: ![Home view](frontend/static/hpage.png)
 - View cameras: ![Camera view](frontend/static/cpage.png)
-- Video demo: TODO add short walkthrough (place in frontend/static/ and link here).
+- Video demo: ![Demo](frontend/static/demo.mp4)
 
 ## Notes
 - Ensure `STREAMER_BIN` env points to the built `build/streamer` binary if not in default location.
