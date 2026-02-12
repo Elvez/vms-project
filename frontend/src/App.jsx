@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Hls from "hls.js";
 
 const VIEWS = {
@@ -14,6 +14,10 @@ export default function App() {
   const [cameras, setCameras] = useState([]);
   const [selectedCamera, setSelectedCamera] = useState(null);
   const [showForm, setShowForm] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [liveQuality, setLiveQuality] = useState("copy");
+  const [playbackQuality, setPlaybackQuality] = useState("high");
   const videoRef = useRef(null);
   const [formData, setFormData] = useState({
     name: "",
@@ -21,14 +25,56 @@ export default function App() {
     maxPlaybackMinutes: ""
   });
 
-  const apiBase = "http://localhost:8000";
+  const apiBase = import.meta.env.VITE_API_BASE || "http://localhost:8000";
   const addCameraApi = `${apiBase}/api/cameras`;
   const liveHlsUrl = selectedCamera
-    ? `${apiBase}/api/cameras/${selectedCamera.id}/live.m3u8`
+    ? `${apiBase}/api/cameras/${selectedCamera.id}/live.m3u8?quality=${liveQuality}`
     : "";
   const playbackHlsUrl = selectedCamera
-    ? `${apiBase}/api/cameras/${selectedCamera.id}/playback.m3u8`
+    ? `${apiBase}/api/cameras/${selectedCamera.id}/playback.m3u8?quality=${playbackQuality}`
     : "";
+  const liveQualityOptions = [
+    { value: "copy", label: "Original" },
+    { value: "low", label: "Low" },
+    { value: "mid", label: "Mid" },
+    { value: "high", label: "High" }
+  ];
+  const playbackQualityOptions = [
+    { value: "high", label: "High" },
+    { value: "mid", label: "Mid" },
+    { value: "low", label: "Low" },
+    { value: "copy", label: "Original" }
+  ];
+
+  const mapCamera = useCallback(
+    (apiCam) => ({
+      ...apiCam,
+      rtspUrl: apiCam.rtsp_url,
+      maxPlaybackMinutes: apiCam.max_playback_minutes
+    }),
+    []
+  );
+
+  const loadCameras = useCallback(async () => {
+    setLoading(true);
+    setNotice("");
+    try {
+      const res = await fetch(`${apiBase}/api/cameras`);
+      if (!res.ok) {
+        throw new Error(`Failed to load cameras (${res.status})`);
+      }
+      const data = await res.json();
+      const mapped = data.map(mapCamera);
+      setCameras(mapped);
+      if (!selectedCamera && mapped.length > 0) {
+        setSelectedCamera(mapped[0]);
+      }
+    } catch (err) {
+      setNotice(err.message || "Unable to load cameras.");
+    } finally {
+      setLoading(false);
+    }
+  }, [apiBase, selectedCamera, mapCamera]);
 
   const title = useMemo(() => {
     if (view === VIEWS.LIVE) return "Live";
@@ -43,13 +89,8 @@ export default function App() {
   };
 
   const handleAddNewCamera = () => {
-    if (cameras.length === 0) {
-      setShowForm(true);
-      return;
-    }
-    setNotice(
-      "This part is not covered by the assignment demonstraction, Thanks"
-    );
+    setNotice("");
+    setShowForm(true);
   };
 
   const handleFormChange = (event) => {
@@ -69,28 +110,47 @@ export default function App() {
     });
   };
 
-  const handleFormSubmit = (event) => {
+  const handleFormSubmit = async (event) => {
     event.preventDefault();
     if (!formData.rtspUrl.trim()) {
       setNotice("RTSP URL is required.");
       return;
     }
-    const newCamera = {
-      id: Date.now(),
+    const maxPlayback = formData.maxPlaybackMinutes.trim()
+      ? Number(formData.maxPlaybackMinutes)
+      : undefined;
+
+    const payload = {
       name: formData.name.trim() || `Camera ${cameras.length + 1}`,
-      rtspUrl: formData.rtspUrl.trim(),
-      maxPlaybackMinutes: formData.maxPlaybackMinutes.trim()
+      rtsp_url: formData.rtspUrl.trim(),
+      max_playback_minutes: maxPlayback || undefined
     };
-    setCameras((prev) => [...prev, newCamera]);
-    setShowForm(false);
-    setNotice(
-      `Camera saved locally. API placeholder: POST ${addCameraApi}`
-    );
-    setFormData({
-      name: "",
-      rtspUrl: "",
-      maxPlaybackMinutes: ""
-    });
+
+    setIsSubmitting(true);
+    setNotice("");
+    try {
+      const res = await fetch(addCameraApi, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
+      if (!res.ok) {
+        throw new Error(`Failed to add camera (${res.status})`);
+      }
+
+      const created = mapCamera(await res.json());
+      setCameras((prev) => [...prev, created]);
+      setSelectedCamera(created);
+      setView(VIEWS.CAMERA);
+      setShowForm(false);
+      setFormData({ name: "", rtspUrl: "", maxPlaybackMinutes: "" });
+      setNotice("Camera added and streaming started.");
+    } catch (err) {
+      setNotice(err.message || "Unable to add camera.");
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const handleSelectCamera = (camera) => {
@@ -99,10 +159,12 @@ export default function App() {
   };
 
   const handleOpenLive = () => {
+    setNotice("");
     setView(VIEWS.LIVE);
   };
 
   const handleOpenPlayback = () => {
+    setNotice("");
     setView(VIEWS.PLAYBACK);
   };
 
@@ -131,6 +193,10 @@ export default function App() {
       video.load();
     };
   }, [view, selectedCamera, liveHlsUrl, playbackHlsUrl]);
+
+  useEffect(() => {
+    loadCameras();
+  }, [loadCameras]);
 
   return (
     <div className="page">
@@ -222,6 +288,41 @@ export default function App() {
                 Back
               </button>
             </div>
+            <div className="player-actions">
+              {view === VIEWS.LIVE && (
+                <label className="select-row">
+                  Quality
+                  <select
+                    className="select"
+                    value={liveQuality}
+                    onChange={(e) => setLiveQuality(e.target.value)}
+                  >
+                    {liveQualityOptions.map((q) => (
+                      <option key={q.value} value={q.value}>
+                        {q.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+
+              {view === VIEWS.PLAYBACK && (
+                <label className="select-row">
+                  Quality
+                  <select
+                    className="select"
+                    value={playbackQuality}
+                    onChange={(e) => setPlaybackQuality(e.target.value)}
+                  >
+                    {playbackQualityOptions.map((q) => (
+                      <option key={q.value} value={q.value}>
+                        {q.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+            </div>
             <div className="player-placeholder">
               <video
                 ref={videoRef}
@@ -231,7 +332,7 @@ export default function App() {
               />
             </div>
             <small className="muted">
-              HLS placeholder: {view === VIEWS.LIVE ? liveHlsUrl : playbackHlsUrl}
+              HLS: {view === VIEWS.LIVE ? liveHlsUrl : playbackHlsUrl}
             </small>
           </div>
         )}
@@ -291,6 +392,10 @@ export default function App() {
           <div className="notice glass">
             {notice}
           </div>
+        )}
+
+        {loading && (
+          <div className="notice glass">Loading cameras...</div>
         )}
       </main>
     </div>
