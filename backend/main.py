@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).resolve().parent
@@ -21,7 +24,7 @@ STREAMER_BIN = os.environ.get("STREAMER_BIN", str(APP_DIR.parent / "build" / "st
 DEFAULT_COPY_HLS_TIME = int(os.environ.get("COPY_HLS_TIME", "0"))
 DEFAULT_ENCODE_HLS_TIME = int(os.environ.get("ENCODE_HLS_TIME", "4"))
 DEFAULT_COPY_KEEP_MIN = int(os.environ.get("COPY_KEEP_MIN", "0"))
-DEFAULT_ENCODE_KEEP_MIN = int(os.environ.get("ENCODE_KEEP_MIN", "5"))
+DEFAULT_ENCODE_KEEP_MIN = int(os.environ.get("ENCODE_KEEP_MIN", "1"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STREAMS_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,6 +53,16 @@ class CameraRecord(BaseModel):
 
 
 app = FastAPI(title="Streamer API", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/streams", StaticFiles(directory=STREAMS_DIR), name="streams")
 
 
 def _load_db() -> List[Dict[str, Any]]:
@@ -146,4 +159,61 @@ def list_cameras() -> List[CameraRecord]:
     with DB_LOCK:
         records = _load_db()
     return [CameraRecord(**rec) for rec in records]
+
+
+def _find_camera(camera_id: str) -> Optional[CameraRecord]:
+    with DB_LOCK:
+        records = _load_db()
+    for rec in records:
+        if rec.get("id") == camera_id:
+            return CameraRecord(**rec)
+    return None
+
+
+def _validate_quality(quality: Optional[str]) -> str:
+    allowed = {"copy", "low", "mid", "high"}
+    if not quality:
+        return "copy"
+    q = quality.lower()
+    if q not in allowed:
+        raise HTTPException(status_code=400, detail="Unsupported quality")
+    return q
+
+
+@app.get("/api/cameras/{camera_id}/live.m3u8")
+def get_live_playlist(camera_id: str, quality: Optional[str] = None):
+    camera = _find_camera(camera_id)
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    q = _validate_quality(quality)
+
+    # Live uses the copy playlist (index.m3u8). Allow quality param for compatibility.
+    target = Path(camera.copy_playlist)
+    if q != "copy":
+        # If caller asks for specific rendition, prefer corresponding playlist if present.
+        attr = f"{q}_playlist"
+        target = Path(getattr(camera, attr, camera.copy_playlist))
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Playlist not available")
+
+    rel_path = target.relative_to(STREAMS_DIR)
+    return RedirectResponse(url=f"/streams/{rel_path.as_posix()}")
+
+
+@app.get("/api/cameras/{camera_id}/playback.m3u8")
+def get_playback_playlist(camera_id: str, quality: Optional[str] = None):
+    camera = _find_camera(camera_id)
+    if not camera:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    q = _validate_quality(quality or "high")
+    target = Path(getattr(camera, f"{q}_playlist", camera.high_playlist))
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Playlist not available")
+
+    rel_path = target.relative_to(STREAMS_DIR)
+    return RedirectResponse(url=f"/streams/{rel_path.as_posix()}")
 
