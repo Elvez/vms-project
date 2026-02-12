@@ -5,6 +5,12 @@
 
 namespace utils {
 
+/**
+ * @brief Check if string starts with prefix
+ * 
+ * @param s 
+ * @param prefix 
+ */
 static inline bool starts_with(
     const std::string &s,
     const char *prefix
@@ -15,6 +21,12 @@ static inline bool starts_with(
   ) == 0;
 }
 
+/**
+ * @brief Get base name without extension from path
+ * 
+ * @param path 
+ * @return std::string 
+ */
 static inline std::string base_without_ext(
     const std::string &path
 ) {
@@ -30,6 +42,11 @@ static inline std::string base_without_ext(
   );
 }
 
+/**
+ * @brief Check if path is a directory
+ * 
+ * @param path 
+ */
 static inline bool is_directory(
     const std::string &path
 ) {
@@ -45,6 +62,14 @@ static inline bool is_directory(
   );
 }
 
+/**
+ * @brief Normalize output path by adding 
+ * "index.m3u8" for directories and ".m3u8" extension 
+ * if missing
+ * 
+ * @param output_path 
+ * @return std::string 
+ */
 static inline std::string normalize_output_path(
     const std::string &output_path
 ) {

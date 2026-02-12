@@ -9,6 +9,15 @@ extern "C" {
 
 namespace utils {
 
+/**
+ * @brief Set the hls output options
+ * 
+ * @param opts dictionary to store HLS options
+ * @param max_keep_minutes maximum minutes to keep in HLS playlist, 0 for unlimited
+ * @param hls_time_sec size of one segment
+ * @param segment_pattern name of segments with pattern, e.g. "segment_%03d.ts"
+ * @return AVERROR code, 0 on success
+ */
 static inline int set_hls_output_options(
     AVDictionary **opts,
     int max_keep_minutes,
@@ -54,6 +63,11 @@ static inline int set_hls_output_options(
   return 0;
 }
 
+/**
+ * @brief Set the h264 encoder options for low latency streaming
+ * 
+ * @param priv_data 
+ */
 static inline void set_h264_encoder_options(
     void *priv_data
 ) {

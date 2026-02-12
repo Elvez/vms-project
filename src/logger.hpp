@@ -6,11 +6,23 @@
 #include <fstream>
 #include <string>
 
+/**
+ * @brief Get logger stream
+ * 
+ * @return std::ofstream& 
+ */
 static inline std::ofstream &log_stream() {
   static std::ofstream stream;
   return stream;
 }
 
+/**
+ * @brief Initialize logger by opening log file
+ * 
+ * @param path 
+ * @return true 
+ * @return false 
+ */
 static inline bool log_init(
     const std::string &path
 ) {
@@ -35,6 +47,9 @@ static inline bool log_init(
   return true;
 }
 
+/**
+ * @brief Close logger stream
+ */
 static inline void log_close() {
   std::ofstream &stream = log_stream();
   if (stream.is_open()) {
@@ -43,6 +58,13 @@ static inline void log_close() {
   }
 }
 
+/**
+ * @brief Log a message with a specific level
+ * @example log_message("ERROR", "Failed to open file: %s", filename.c_str());
+ * @param level 
+ * @param fmt 
+ * @param ... 
+ */
 static inline void log_message(
     const char *level,
     const char *fmt,
@@ -55,12 +77,7 @@ static inline void log_message(
 
   std::time_t now = std::time(nullptr);
   std::tm tm_buf;
-#if defined(_WIN32)
-  localtime_s(&tm_buf, &now);
-#else
   localtime_r(&now, &tm_buf);
-#endif
-
   char ts[32];
   std::strftime(
       ts,
